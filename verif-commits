@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Vérificateur de commits pour les projets et scripts locaux.
+
+Interface terminal interactive : scanne les dépôts git, récupère les
+changements distants (fetch) et signale ceux qui ne sont pas à jour.
+"""
+from __future__ import annotations
+
+import argparse
+import curses
+import locale
+import os
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_ROOTS = [
+    ("~/Applications", False),
+    ("~/.local/bin", False),
+    ("~/.local/share", True),
+]
+IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".cache", ".venv", "venv"}
+FETCH_TIMEOUT = 25
+GIT_ENV = {
+    **os.environ,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=10",
+    "LC_ALL": "C.UTF-8",
+}
+
+OK, WARN, ERR, INFO, DIM = 1, 2, 3, 4, 5
+
+
+@dataclass
+class Entry:
+    path: Path
+    name: str
+    is_repo: bool = False
+    branch: str = ""
+    upstream: str = ""
+    remote_url: str = ""
+    ahead: int = 0
+    behind: int = 0
+    dirty: list[str] = field(default_factory=list)
+    last_hash: str = ""
+    last_date: str = ""
+    last_author: str = ""
+    last_subject: str = ""
+    fetch_ok: bool = True
+    fetch_error: str = ""
+
+    @property
+    def state(self) -> str:
+        if not self.is_repo:
+            return "hors git"
+        if not self.fetch_ok:
+            return "erreur fetch"
+        if not self.upstream:
+            return "sans remote"
+        if self.ahead and self.behind:
+            return f"divergent {self.ahead}↑ {self.behind}↓"
+        if self.behind:
+            return f"{self.behind} en retard"
+        if self.ahead:
+            return f"{self.ahead} en avance"
+        return "à jour"
+
+    @property
+    def severity(self) -> int:
+        if not self.is_repo:
+            return 6
+        if not self.fetch_ok:
+            return 0
+        if self.behind or (self.ahead and self.behind):
+            return 1
+        if self.ahead:
+            return 2
+        if self.upstream:
+            return 3
+        return 4
+
+    @property
+    def color(self) -> int:
+        if not self.is_repo:
+            return DIM
+        if not self.fetch_ok or self.behind:
+            return ERR
+        if self.ahead or self.dirty or not self.upstream:
+            return WARN
+        return OK
+
+
+def run(args: list[str], cwd: Path, timeout: int = 10) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(
+            args,
+            cwd=cwd,
+            env=GIT_ENV,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        out, err = p.stdout.strip(), p.stderr.strip()
+        return p.returncode == 0, out if p.returncode == 0 else (err or out)
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def scan_entry(path: Path) -> Entry:
+    entry = Entry(path=path, name=path.name)
+    if not (path / ".git").exists():
+        return entry
+
+    entry.is_repo = True
+    ok, branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], path)
+    entry.branch = branch if ok else "?"
+    ok, url = run(["git", "remote", "get-url", "origin"], path)
+    if ok:
+        entry.remote_url = url
+
+    ok_fetch, fetch_out = run(
+        ["git", "fetch", "--quiet", "--prune"], path, timeout=FETCH_TIMEOUT
+    )
+    if not ok_fetch:
+        entry.fetch_ok = False
+        entry.fetch_error = fetch_out or "échec du fetch"
+
+    ok, upstream = run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], path
+    )
+    if ok:
+        entry.upstream = upstream
+        ok, counts = run(
+            ["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], path
+        )
+        if ok and counts:
+            parts = counts.split()
+            if len(parts) == 2:
+                entry.ahead, entry.behind = int(parts[0]), int(parts[1])
+
+    ok, status = run(["git", "status", "--porcelain"], path)
+    if ok and status:
+        entry.dirty = status.splitlines()
+
+    ok, last = run(
+        [
+            "git",
+            "log",
+            "-1",
+            "--date=format:%d/%m %H:%M",
+            "--format=%h%x00%cd%x00%an%x00%s",
+        ],
+        path,
+    )
+    if ok and last:
+        parts = last.split("\0")
+        if len(parts) >= 4:
+            entry.last_hash, entry.last_date, entry.last_author, entry.last_subject = (
+                parts[0],
+                parts[1],
+                parts[2],
+                "\0".join(parts[3:]),
+            )
+    return entry
+
+
+def find_repos(root: Path, max_depth: int = 4) -> list[Path]:
+    """Trouve les dépôts git sous root sans descendre dans les dépôts trouvés."""
+    found: list[Path] = []
+    base_depth = len(root.parts)
+    for current, dirs, _files in os.walk(root):
+        path = Path(current)
+        if (path / ".git").exists():
+            found.append(path)
+            dirs[:] = []
+            continue
+        if len(path.parts) - base_depth >= max_depth:
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(
+            d for d in dirs if d not in IGNORED_DIRS and not d.startswith(".")
+        )
+    return found
+
+
+def looks_like_project(path: Path) -> bool:
+    markers = (
+        "*.py",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "build.gradle",
+        "pom.xml",
+        "pyproject.toml",
+        "setup.py",
+        "*.csproj",
+    )
+    return any(any(path.glob(marker)) for marker in markers)
+
+
+def discover(roots: list[tuple[Path, bool]]) -> list[Entry]:
+    targets: list[Path] = []
+    for root, repos_only in roots:
+        root = root.expanduser()
+        if not root.is_dir():
+            continue
+        if repos_only:
+            repos = find_repos(root)
+            targets.extend(repos)
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if child in repos or not child.is_dir() or child.name.startswith("."):
+                    continue
+                if looks_like_project(child):
+                    targets.append(child)
+            continue
+        try:
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if child.name.startswith("."):
+                    continue
+                if child.is_dir() or child.is_file():
+                    targets.append(child)
+        except PermissionError:
+            continue
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        entries = list(pool.map(scan_entry, targets))
+    entries.sort(key=lambda e: (e.severity, e.name.lower()))
+    return entries
+
+
+def fmt_commit(entry: Entry) -> str:
+    if not entry.is_repo or not entry.last_hash:
+        return "-"
+    return f"{entry.last_hash} {entry.last_date}"
+
+
+def short(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+
+
+def problems(entries: list[Entry]) -> list[Entry]:
+    return [
+        e
+        for e in entries
+        if e.is_repo and (not e.fetch_ok or e.behind or not e.upstream)
+    ]
+
+
+def visible_entries(entries: list[Entry], issues_only: bool) -> list[Entry]:
+    if issues_only:
+        return [
+            e
+            for e in entries
+            if e.is_repo
+            and (e.behind or not e.fetch_ok or not e.upstream or e.ahead or e.dirty)
+        ]
+    return [e for e in entries if e.is_repo] + [e for e in entries if not e.is_repo]
+
+
+def show_progress(stdscr, text: str) -> None:
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.addnstr(
+        h // 2, max(0, (w - len(text)) // 2), short(text, w - 1), w - 1,
+        curses.A_BOLD,
+    )
+    stdscr.refresh()
+
+
+def dialog(stdscr, title: str, lines: list[str], options: list[tuple[str, str]],
+           default: str | None = None) -> str | None:
+    h, w = stdscr.getmaxyx()
+    hint = "  ".join(f"[{key.upper()}] {label}" for key, label in options)
+    width = max(
+        [len(title) + 6, len(hint) + 4] + [len(line) + 6 for line in lines]
+    )
+    width = min(max(width, 34), w - 4)
+    height = min(len(lines) + 4, h - 2)
+    y0 = max(0, (h - height) // 2)
+    x0 = max(0, (w - width) // 2)
+    win = curses.newwin(height, width, y0, x0)
+    win.keypad(True)
+    win.erase()
+    win.box()
+    win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4, curses.A_BOLD)
+    for i, line in enumerate(lines):
+        win.addnstr(1 + i, 2, short(line, width - 4), width - 4)
+    win.addnstr(
+        height - 2, 2, short(hint, width - 4), width - 4, curses.color_pair(INFO)
+    )
+    win.refresh()
+    while True:
+        try:
+            key = win.getch()
+        except KeyboardInterrupt:
+            return None
+        if key == curses.KEY_RESIZE:
+            continue
+        if key in (10, 13, curses.KEY_ENTER):
+            return default
+        if key == 27:
+            return None
+        if 0 <= key < 256:
+            char = chr(key).lower()
+            if any(char == option[0].lower() for option in options):
+                return char
+
+
+def git_identity(cwd: Path) -> tuple[str, str]:
+    _, name = run(["git", "config", "--global", "user.name"], cwd)
+    _, email = run(["git", "config", "--global", "user.email"], cwd)
+    if not name:
+        ok, login = run(["gh", "api", "user", "--jq", ".login"], cwd, timeout=15)
+        name = login if ok and login else os.environ.get("USER", "utilisateur")
+    if not email:
+        ok, mail = run(["gh", "api", "user", "--jq", ".email"], cwd, timeout=15)
+        if ok and mail and mail != "null":
+            email = mail
+        else:
+            email = f"{name}@users.noreply.github.com"
+    return name, email
+
+
+def init_and_commit(path: Path) -> tuple[bool, str]:
+    ok, _ = run(["git", "init", "-b", "main"], path, timeout=20)
+    if not ok:
+        ok, _ = run(["git", "init"], path, timeout=20)
+        if not ok:
+            return False, "impossible d'initialiser le dépôt"
+        run(["git", "branch", "-M", "main"], path)
+    name, email = git_identity(path)
+    run(["git", "config", "user.name", name], path)
+    run(["git", "config", "user.email", email], path)
+    ok, _ = run(["git", "add", "-A"], path, timeout=60)
+    if not ok:
+        return False, "échec de l'ajout des fichiers"
+    ok, out = run(
+        ["git", "commit", "-m", "chore: initialisation du dépôt"], path, timeout=60
+    )
+    if not ok:
+        return False, out or "aucun fichier à committer"
+    return True, "Dépôt git créé et premier commit effectué."
+
+
+def publish_repo(path: Path, name: str, private: bool) -> tuple[bool, str]:
+    ok, owner = run(["gh", "api", "user", "--jq", ".login"], path, timeout=15)
+    if not ok or not owner:
+        return False, "gh n'est pas authentifié"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "projet"
+    visibility = "--private" if private else "--public"
+    ok, out = run(
+        [
+            "gh", "repo", "create", f"{owner}/{slug}", visibility,
+            "--source", str(path), "--remote", "origin", "--push",
+        ],
+        path,
+        timeout=120,
+    )
+    if ok:
+        return True, f"Publié sur https://github.com/{owner}/{slug}"
+    return False, out or "échec de la création sur GitHub"
+
+
+def create_flow(stdscr, entry: Entry) -> str:
+    if not entry.path.is_dir():
+        return "Seuls les dossiers peuvent être initialisés."
+    choice = dialog(
+        stdscr,
+        "Créer un dépôt git ?",
+        [str(entry.path), "Un premier commit sera créé."],
+        [("o", "Oui"), ("n", "Non")],
+        default="n",
+    )
+    if choice != "o":
+        return "Création annulée."
+    show_progress(stdscr, f"Initialisation de {entry.name}…")
+    ok, message = init_and_commit(entry.path)
+    if not ok:
+        return f"Échec : {message}"
+    choice = dialog(
+        stdscr,
+        "Publier sur GitHub ?",
+        [message, "Choisir la visibilité du dépôt distant."],
+        [("o", "Public"), ("p", "Privé"), ("n", "Local seulement")],
+        default="n",
+    )
+    if choice in ("o", "p"):
+        show_progress(stdscr, "Création du dépôt GitHub…")
+        ok, published = publish_repo(entry.path, entry.name, choice == "p")
+        if not ok:
+            return f"Dépôt local créé, publication échouée : {published}"
+        return published
+    return message
+
+
+def print_report(entries: list[Entry]) -> int:
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    print(f"Vérification des commits — {now}\n")
+    for e in entries:
+        if not e.is_repo:
+            print(f"  {e.name:<24} hors git")
+            continue
+        extra = f" (+{len(e.dirty)} modif.)" if e.dirty else ""
+        print(
+            f"  {e.name:<24} {e.branch:<12} {e.state:<20}{extra}"
+            f"  {fmt_commit(e)}  {short(e.last_subject, 50)}"
+        )
+    bad = problems(entries)
+    print()
+    if bad:
+        print(f"{len(bad)} dépôt(s) à vérifier : " + ", ".join(e.name for e in bad))
+        return 1
+    print("Tous les dépôts suivis sont à jour.")
+    return 0
+
+
+def draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, message):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    if h < 8 or w < 50:
+        stdscr.addnstr(0, 0, "Terminal trop petit", max(0, w - 1))
+        stdscr.refresh()
+        return selected, offset
+
+    repos = [e for e in entries if e.is_repo]
+    visible = visible_entries(entries, issues_only)
+
+    if visible:
+        selected = max(0, min(selected, len(visible) - 1))
+    else:
+        selected = 0
+
+    header = f" Commit Check — {len(repos)} dépôts · scan {last_scan} ({duration:.1f}s)"
+    stdscr.attron(curses.A_BOLD)
+    stdscr.addnstr(0, 0, header, w - 1, curses.color_pair(INFO))
+    stdscr.attroff(curses.A_BOLD)
+
+    bad = problems(entries)
+    summary = (
+        f" {len(bad)} à vérifier · "
+        f"{sum(1 for e in repos if e.dirty)} avec modifs non commitées"
+    )
+    stdscr.addnstr(1, 0, summary, w - 1, curses.color_pair(ERR if bad else OK))
+
+    if w >= 90:
+        cols = [
+            ("Dépôt", 22),
+            ("Branche", 11),
+            ("État", 17),
+            ("Modifs", 7),
+            ("Dernier commit", 18),
+            ("Message", w - 79),
+        ]
+    elif w >= 72:
+        cols = [
+            ("Dépôt", 18),
+            ("Branche", 9),
+            ("État", 15),
+            ("Modifs", 6),
+            ("Commit", 18),
+            ("Message", w - 69),
+        ]
+    else:
+        cols = [
+            ("Dépôt", 16),
+            ("Branche", 8),
+            ("État", 14),
+            ("Modifs", 5),
+            ("Message", w - 45),
+        ]
+    x = 1
+    stdscr.attron(curses.A_UNDERLINE)
+    for label, width in cols:
+        stdscr.addnstr(3, x, label, width)
+        x += width
+    stdscr.attroff(curses.A_UNDERLINE)
+
+    detail_h = 0 if not visible else min(9, max(6, h - 7))
+    table_top = 4
+    table_bottom = h - detail_h - 2
+    rows = max(1, table_bottom - table_top)
+    if selected < offset:
+        offset = selected
+    elif selected >= offset + rows:
+        offset = selected - rows + 1
+
+    for i, e in enumerate(visible[offset : offset + rows]):
+        y = table_top + i
+        attr = curses.color_pair(e.color)
+        if offset + i == selected:
+            attr |= curses.A_REVERSE
+        values = [
+            (e.name, cols[0][1]),
+            (e.branch or "-", cols[1][1]),
+            (e.state, cols[2][1]),
+            (str(len(e.dirty)) if e.is_repo else "-", cols[3][1]),
+            (fmt_commit(e), cols[4][1]),
+        ]
+        if len(cols) == 6:
+            values.append((e.last_subject or "", cols[5][1]))
+        x = 1
+        for value, width in values:
+            stdscr.addnstr(y, x, short(value, width - 1), width - 1, attr)
+            x += width
+
+    if not visible:
+        stdscr.addnstr(table_top + 1, 2, "Aucun problème détecté.", w - 4,
+                       curses.color_pair(OK))
+
+    if detail_h and visible:
+        e = visible[selected]
+        top = h - detail_h - 1
+        stdscr.addnstr(top, 1, "─" * (w - 2), w - 2, curses.color_pair(DIM))
+        y = top + 1
+        stdscr.addnstr(y, 2, short(str(e.path), w - 4), w - 4, curses.color_pair(INFO))
+        y += 1
+        if e.is_repo:
+            line = f"Remote : {e.remote_url or '-'}"
+            if e.upstream:
+                line += f"   Suivi : {e.upstream}   Avance/retard : {e.ahead}/{e.behind}"
+            stdscr.addnstr(y, 2, short(line, w - 4), w - 4)
+            y += 1
+            if e.last_hash:
+                line = f"{e.last_hash} · {e.last_date} · {e.last_author} — {e.last_subject}"
+                stdscr.addnstr(y, 2, short(line, w - 4), w - 4)
+                y += 1
+            if e.dirty:
+                files = ", ".join(line[3:] if len(line) > 3 else line for line in e.dirty[:4])
+                more = " …" if len(e.dirty) > 4 else ""
+                stdscr.addnstr(
+                    y, 2, short(f"Modifs : {files}{more}", w - 4), w - 4,
+                    curses.color_pair(WARN),
+                )
+            elif not e.fetch_ok:
+                stdscr.addnstr(
+                    y, 2, short(f"Erreur : {e.fetch_error}", w - 4), w - 4,
+                    curses.color_pair(ERR),
+                )
+        else:
+            if e.path.is_dir():
+                hint = "Pas un dépôt git — appuyer sur c pour l'initialiser."
+            else:
+                hint = "Pas un dépôt git (fichier) — création non proposée."
+            stdscr.addnstr(y, 2, short(hint, w - 4), w - 4, curses.color_pair(DIM))
+        stdscr.addnstr(y + 1, 2, message, w - 4, curses.color_pair(DIM))
+
+    footer = " ↑↓ naviguer · r rafraîchir · f filtre · c créer · q quitter"
+    if issues_only:
+        footer = " [filtre problèmes] " + footer
+    stdscr.addnstr(h - 1, 0, short(footer, w - 1), w - 1, curses.A_REVERSE)
+    stdscr.refresh()
+    return selected, offset
+
+
+def run_tui(stdscr, roots: list[Path]):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for idx, fg in ((OK, curses.COLOR_GREEN), (WARN, curses.COLOR_YELLOW),
+                    (ERR, curses.COLOR_RED), (INFO, curses.COLOR_CYAN), (DIM, -1)):
+        curses.init_pair(idx, fg, -1)
+    stdscr.keypad(True)
+
+    entries: list[Entry] = []
+    selected = 0
+    offset = 0
+    issues_only = False
+    message = "Scan en cours…"
+    last_scan = "-"
+    duration = 0.0
+
+    def refresh():
+        nonlocal entries, last_scan, duration, message
+        message = "Scan en cours…"
+        draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, message)
+        start = time.monotonic()
+        entries = discover(roots)
+        duration = time.monotonic() - start
+        last_scan = datetime.now().strftime("%H:%M:%S")
+        message = f"{len(problems(entries))} dépôt(s) à vérifier"
+
+    refresh()
+    while True:
+        selected, offset = draw(
+            stdscr, entries, selected, offset, last_scan, duration, issues_only, message
+        )
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            break
+        if key in (ord("q"), ord("Q"), 27):
+            break
+        if key in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected += 1
+        elif key in (curses.KEY_HOME, ord("g")):
+            selected = 0
+        elif key in (curses.KEY_END, ord("G")):
+            selected = 10**6
+        elif key in (ord("r"), ord("R"), curses.KEY_RESIZE):
+            refresh()
+        elif key in (ord("f"), ord("F")):
+            issues_only = not issues_only
+            selected = 0
+            offset = 0
+        elif key in (ord("c"), ord("C")):
+            visible = visible_entries(entries, issues_only)
+            if not visible:
+                message = "Aucune entrée sélectionnée."
+                continue
+            entry = visible[min(selected, len(visible) - 1)]
+            if entry.is_repo:
+                message = f"{entry.name} est déjà un dépôt git."
+            elif not entry.path.is_dir():
+                message = "Seuls les dossiers peuvent être initialisés."
+            else:
+                result = create_flow(stdscr, entry)
+                refresh()
+                message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Vérifie que les dépôts git sont à jour avec leur remote."
+    )
+    parser.add_argument(
+        "--root",
+        action="append",
+        dest="roots",
+        help="dossier à scanner en plus des dossiers par défaut",
+    )
+    parser.add_argument(
+        "--once", action="store_true", help="rapport texte non interactif"
+    )
+    args = parser.parse_args()
+    roots = [(Path(p), repos_only) for p, repos_only in DEFAULT_ROOTS]
+    roots += [(Path(p), False) for p in (args.roots or [])]
+
+    if args.once or not sys.stdout.isatty():
+        locale.setlocale(locale.LC_ALL, "")
+        return print_report(discover(roots))
+
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(run_tui, roots)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
