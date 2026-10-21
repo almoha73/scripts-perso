@@ -216,14 +216,19 @@ def discover(roots: list[tuple[Path, bool]]) -> list[Entry]:
             repos = find_repos(root)
             targets.extend(repos)
             for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-                if child in repos or not child.is_dir() or child.name.startswith("."):
+                if (
+                    child in repos
+                    or child.is_symlink()
+                    or not child.is_dir()
+                    or child.name.startswith(".")
+                ):
                     continue
                 if looks_like_project(child):
                     targets.append(child)
             continue
         try:
             for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-                if child.name.startswith("."):
+                if child.name.startswith(".") or child.is_symlink():
                     continue
                 if child.is_dir() or child.is_file():
                     targets.append(child)
