@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import font as tkfont, ttk
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 BG = "#0f1419"
@@ -644,6 +645,11 @@ CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 
 _claude_scan_cache = {}
 _claude_profile_cache = {}
+# L'endpoint /usage est fortement limité : on l'interroge au plus toutes les 5 min
+# et, après un 429, on attend le délai demandé (Retry-After) en gardant les dernières valeurs.
+CLAUDE_USAGE_MIN_INTERVAL = 300
+CLAUDE_USAGE_BACKOFF = 600
+_claude_usage_cache = {"usage": None, "fetched_at": 0.0, "next_try": 0.0}
 
 
 def pretty_claude_model(model_id):
@@ -793,15 +799,37 @@ def fetch_claude_data():
         result["error"] = "Claude : jeton expiré, ouvre Claude Code pour le renouveler."
         return result
 
-    try:
-        usage = claude_get(token, "usage")
-    except Exception as err:
-        text = str(err)
-        if "401" in text or "403" in text:
-            result["error"] = "Claude : jeton refusé, ouvre Claude Code pour le renouveler."
-        else:
-            result["error"] = "Claude : " + (text or "erreur inconnue")
-        return result
+    cache = _claude_usage_cache
+    now = time.time()
+    usage = None
+    if now < cache["next_try"]:
+        if cache["usage"] is None:
+            result["error"] = "Claude : trop de requêtes (429), nouvel essai à " + time.strftime(
+                "%H:%M", time.localtime(cache["next_try"]))
+            return result
+        usage = cache["usage"]
+    else:
+        try:
+            usage = claude_get(token, "usage")
+            cache.update(usage=usage, fetched_at=now, next_try=now + CLAUDE_USAGE_MIN_INTERVAL)
+        except Exception as err:
+            text = str(err)
+            if isinstance(err, HTTPError) and err.code == 429:
+                try:
+                    delay = int(err.headers.get("Retry-After") or 0)
+                except ValueError:
+                    delay = 0
+                cache["next_try"] = now + max(delay, CLAUDE_USAGE_BACKOFF)
+                text = "trop de requêtes (429), nouvel essai à " + time.strftime(
+                    "%H:%M", time.localtime(cache["next_try"]))
+            elif "401" in text or "403" in text:
+                text = "jeton refusé, ouvre Claude Code pour le renouveler."
+            if cache["usage"] is None:
+                result["error"] = "Claude : " + (text or "erreur inconnue")
+                return result
+            usage = cache["usage"]
+    if cache["fetched_at"] and now - cache["fetched_at"] > CLAUDE_USAGE_MIN_INTERVAL + 30:
+        result["stale"] = time.strftime("%H:%M", time.localtime(cache["fetched_at"]))
 
     limits = []
     for raw in usage.get("limits") or []:
@@ -1722,7 +1750,8 @@ class GoMonitor(tk.Tk):
                 format_tokens(int(local.get("input", 0)) + int(local.get("output", 0))),
                 CLAUDE_ORANGE, "jetons sur 30 jours", "quotas indisponibles",
             )
-        self.claude_card.set_status(bool(self.claude.get("ok")))
+        stale = self.claude.get("stale")
+        self.claude_card.set_status(bool(self.claude.get("ok")), f"données de {stale}" if stale else None)
         self.claude_card.set_stats([
             self.claude.get("plan") or "Claude Max",
             self.claude.get("email") or "—",
