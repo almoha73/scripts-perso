@@ -578,7 +578,9 @@ def commit_flow(stdscr, entry: Entry) -> str:
         return "Commit annulé."
     message = default_message
     if choice == "m":
-        edited = input_dialog(stdscr, "Message de commit", "Message :", message)
+        edited = input_dialog(
+            stdscr, "Message de commit", "Message (vide = défaut) :", ""
+        )
         if edited is None:
             return "Commit annulé."
         message = edited or message
