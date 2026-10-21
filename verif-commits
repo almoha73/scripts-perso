@@ -11,6 +11,7 @@ import curses
 import locale
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -25,6 +26,9 @@ DEFAULT_ROOTS = [
     ("~/.local/share", True),
 ]
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".cache", ".venv", "venv"}
+SCRIPTS_REPO = Path(
+    os.environ.get("VERIF_SCRIPTS_REPO", "~/Applications/scripts-perso")
+).expanduser()
 FETCH_TIMEOUT = 25
 GIT_ENV = {
     **os.environ,
@@ -375,6 +379,59 @@ def publish_repo(path: Path, name: str, private: bool) -> tuple[bool, str]:
     return False, out or "échec de la création sur GitHub"
 
 
+def is_moveable_script(path: Path) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def move_script_flow(stdscr, entry: Entry) -> str:
+    source = entry.path
+    destination = SCRIPTS_REPO / source.name
+    if not SCRIPTS_REPO.is_dir():
+        return f"Dépôt introuvable : {SCRIPTS_REPO}"
+    if destination.exists():
+        return f"Un fichier {source.name} existe déjà dans scripts-perso."
+    choice = dialog(
+        stdscr,
+        "Déplacer dans scripts-perso ?",
+        [
+            str(source),
+            f"Vers {destination}",
+            "Un lien symbolique sera laissé à l'emplacement actuel.",
+        ],
+        [("o", "Oui"), ("n", "Non")],
+        default="n",
+    )
+    if choice != "o":
+        return "Déplacement annulé."
+    show_progress(stdscr, f"Déplacement de {source.name}…")
+    try:
+        shutil.move(str(source), str(destination))
+        os.symlink(destination, source)
+    except OSError as exc:
+        return f"Échec du déplacement : {exc}"
+    ok, out = run(["git", "add", "--", str(destination)], SCRIPTS_REPO, timeout=30)
+    if not ok:
+        return f"Fichier déplacé, mais échec de git add : {out}"
+    ok, out = run(
+        ["git", "commit", "-m", f"feat: ajout de {source.name}"],
+        SCRIPTS_REPO,
+        timeout=30,
+    )
+    if not ok:
+        return f"Fichier déplacé, mais échec du commit : {out}"
+    show_progress(stdscr, "Envoi vers GitHub…")
+    ok, out = run(["git", "push", "origin", "HEAD"], SCRIPTS_REPO, timeout=120)
+    if not ok:
+        return f"Déplacé et commité, mais push échoué : {out}"
+    return f"{source.name} déplacé dans scripts-perso, commité et poussé."
+
+
 def create_flow(stdscr, entry: Entry) -> str:
     if not entry.path.is_dir():
         return "Seuls les dossiers peuvent être initialisés."
@@ -553,8 +610,10 @@ def draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, me
         else:
             if e.path.is_dir():
                 hint = "Pas un dépôt git — appuyer sur c pour l'initialiser."
+            elif is_moveable_script(e.path):
+                hint = "Script hors git — appuyer sur c pour le déplacer dans scripts-perso."
             else:
-                hint = "Pas un dépôt git (fichier) — création non proposée."
+                hint = "Fichier hors git — déplacement non proposé."
             stdscr.addnstr(y, 2, short(hint, w - 4), w - 4, curses.color_pair(DIM))
         stdscr.addnstr(y + 1, 2, message, w - 4, curses.color_pair(DIM))
 
@@ -625,12 +684,16 @@ def run_tui(stdscr, roots: list[Path]):
             entry = visible[min(selected, len(visible) - 1)]
             if entry.is_repo:
                 message = f"{entry.name} est déjà un dépôt git."
-            elif not entry.path.is_dir():
-                message = "Seuls les dossiers peuvent être initialisés."
-            else:
+            elif entry.path.is_dir():
                 result = create_flow(stdscr, entry)
                 refresh()
                 message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
+            elif is_moveable_script(entry.path):
+                result = move_script_flow(stdscr, entry)
+                refresh()
+                message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
+            else:
+                message = "Ce fichier n'est pas un script déplaçable."
 
 
 def main() -> int:
