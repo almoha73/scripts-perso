@@ -3,19 +3,32 @@
 from __future__ import annotations
 
 import argparse
-import curses
 import locale
 import os
 import re
 import shutil
 import subprocess
 import sys
-import textwrap
+import threading
 import time
+import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from tkinter import font as tkfont, ttk
+
+BG = "#0f1419"
+CARD = "#171f27"
+CARD2 = "#1c2630"
+ROW_ALT = "#151d25"
+TEXT = "#e6edf3"
+MUTED = "#8b98a5"
+ACCENT = "#4cc2ff"
+GREEN = "#3ddc84"
+ORANGE = "#f5a623"
+RED = "#ff5c5c"
+FONT = "DejaVu Sans"
 
 DEFAULT_ROOTS = [
     ("~/Applications", False),
@@ -26,6 +39,7 @@ IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".cache", ".venv", "venv"
 SCRIPTS_REPO = Path(
     os.environ.get("VERIF_SCRIPTS_REPO", "~/Applications/scripts-perso")
 ).expanduser()
+ICON_PATH = Path.home() / ".local/share/icons/hicolor/256x256/apps/verif-commits.png"
 FETCH_TIMEOUT = 25
 GIT_ENV = {
     **os.environ,
@@ -35,7 +49,6 @@ GIT_ENV = {
 }
 
 OK, WARN, ERR, INFO, DIM = 1, 2, 3, 4, 5
-PAIRS: dict[str, int] = {}
 
 
 @dataclass
@@ -245,7 +258,7 @@ def fmt_commit(entry: Entry, full: bool = True) -> str:
     if not entry.is_repo or not entry.last_hash:
         return "-"
     if full and entry.last_date:
-        return f"{entry.last_hash} {entry.last_date}"
+        return f"{entry.last_hash}  {entry.last_date}"
     return entry.last_hash
 
 
@@ -263,226 +276,24 @@ def problems(entries: list[Entry]) -> list[Entry]:
     ]
 
 
-def visible_entries(entries: list[Entry], issues_only: bool) -> list[Entry]:
-    if issues_only:
-        return [
-            e
-            for e in entries
-            if e.is_repo
-            and (e.behind or not e.fetch_ok or not e.upstream or e.ahead or e.dirty)
-        ]
-    return [e for e in entries if e.is_repo] + [e for e in entries if not e.is_repo]
-
-
 def state_text(entry: Entry) -> str:
     if not entry.is_repo:
-        return "○ hors git"
+        return "○  hors git"
     if not entry.fetch_ok:
-        return "✕ erreur fetch"
+        return "✕  erreur fetch"
     if not entry.upstream:
-        return "○ sans remote"
+        return "○  sans remote"
     if entry.ahead and entry.behind:
-        return f"◆ {entry.ahead}↑ {entry.behind}↓"
+        return f"◆  {entry.ahead}↑  {entry.behind}↓"
     if entry.behind:
-        return f"↓ {entry.behind} en retard"
+        return f"↓  {entry.behind} en retard"
     if entry.ahead:
-        return f"↑ {entry.ahead} en avance"
-    return "✓ à jour"
+        return f"↑  {entry.ahead} en avance"
+    return "✓  à jour"
 
 
-def cp(name: str) -> int:
-    return curses.color_pair(PAIRS[name])
-
-
-def setup_colors() -> None:
-    if not curses.has_colors():
-        for name in (
-            "bg", "muted", "accent", "ok", "warn", "err", "border",
-            "card", "card_muted", "card_accent", "card_ok", "card_warn",
-            "card_err", "sel", "bar", "bar_key",
-        ):
-            PAIRS[name] = 0
-        return
-    curses.start_color()
-    try:
-        curses.use_default_colors()
-        default = -1
-    except curses.error:
-        default = curses.COLOR_BLACK
-
-    if curses.COLORS >= 256:
-        bg, card, card2, text = 234, 235, 237, 255
-        muted, accent, green, orange, red = 244, 81, 79, 214, 203
-    else:
-        bg = card = card2 = default
-        text = muted = curses.COLOR_WHITE
-        accent = curses.COLOR_CYAN
-        green = curses.COLOR_GREEN
-        orange = curses.COLOR_YELLOW
-        red = curses.COLOR_RED
-
-    specs = {
-        "bg": (text, bg),
-        "muted": (muted, bg),
-        "accent": (accent, bg),
-        "ok": (green, bg),
-        "warn": (orange, bg),
-        "err": (red, bg),
-        "border": (card2, bg),
-        "card": (text, card),
-        "card_muted": (muted, card),
-        "card_accent": (accent, card),
-        "card_ok": (green, card),
-        "card_warn": (orange, card),
-        "card_err": (red, card),
-        "sel": (bg, accent),
-        "bar": (muted, card2),
-        "bar_key": (text, card2),
-    }
-    for index, (name, (fg, bkg)) in enumerate(specs.items(), start=1):
-        try:
-            curses.init_pair(index, fg, bkg)
-            PAIRS[name] = index
-        except curses.error:
-            PAIRS[name] = 0
-
-
-def put(scr, y: int, x: int, text: str, attr: int, width: int | None = None) -> None:
-    h, w = scr.getmaxyx()
-    if y < 0 or y >= h or x < 0 or x >= w or not text:
-        return
-    limit = max(0, w - x - 1)
-    if width is not None:
-        limit = min(limit, width)
-    try:
-        scr.addnstr(y, x, text, limit, attr)
-    except curses.error:
-        pass
-
-
-def fill(scr, y: int, x1: int, x2: int, pair: str, char: str = " ") -> None:
-    if x2 < x1:
-        return
-    put(scr, y, x1, char * (x2 - x1 + 1), cp(pair), x2 - x1 + 1)
-
-
-def draw_box(scr, top: int, left: int, bottom: int, right: int) -> None:
-    if bottom <= top or right <= left:
-        return
-    attr = cp("border")
-    try:
-        scr.attron(attr)
-        for x in range(left + 1, right):
-            scr.addch(top, x, curses.ACS_HLINE)
-            scr.addch(bottom, x, curses.ACS_HLINE)
-        for y in range(top + 1, bottom):
-            scr.addch(y, left, curses.ACS_VLINE)
-            scr.addch(y, right, curses.ACS_VLINE)
-        scr.addch(top, left, curses.ACS_ULCORNER)
-        scr.addch(top, right, curses.ACS_URCORNER)
-        scr.addch(bottom, left, curses.ACS_LLCORNER)
-        scr.addch(bottom, right, curses.ACS_LRCORNER)
-        scr.attroff(attr)
-    except curses.error:
-        pass
-
-
-def show_progress(stdscr, text: str) -> None:
-    h, w = stdscr.getmaxyx()
-    stdscr.erase()
-    put(stdscr, h // 2, max(0, (w - len(text)) // 2), text, cp("accent") | curses.A_BOLD)
-    stdscr.refresh()
-
-
-def dialog(stdscr, title: str, lines: list[str], options: list[tuple[str, str]],
-           default: str | None = None) -> str | None:
-    h, w = stdscr.getmaxyx()
-    hint = "  ".join(f"[{key.upper()}] {label}" for key, label in options)
-    width = max([len(title) + 8, len(hint) + 6] + [len(line) + 8 for line in lines])
-    width = min(max(width, 38), w - 4)
-    height = min(len(lines) + 5, h - 2)
-    y0 = max(0, (h - height) // 2)
-    x0 = max(0, (w - width) // 2)
-    win = curses.newwin(height, width, y0, x0)
-    win.keypad(True)
-    win.bkgd(" ", cp("card"))
-    win.erase()
-    win.attron(cp("border"))
-    win.box()
-    win.attroff(cp("border"))
-    win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4,
-                cp("card_accent") | curses.A_BOLD)
-    for i, line in enumerate(lines):
-        win.addnstr(1 + i, 3, short(line, width - 7), width - 7, cp("card"))
-    win.addnstr(height - 2, 3, short(hint, width - 7), width - 7, cp("card_accent"))
-    win.refresh()
-    while True:
-        try:
-            key = win.getch()
-        except KeyboardInterrupt:
-            return None
-        if key == curses.KEY_RESIZE:
-            continue
-        if key in (10, 13, curses.KEY_ENTER):
-            return default
-        if key == 27:
-            return None
-        if 0 <= key < 256:
-            char = chr(key).lower()
-            if any(char == option[0].lower() for option in options):
-                return char
-
-
-def input_dialog(stdscr, title: str, prompt: str, default: str = "") -> str | None:
-    h, w = stdscr.getmaxyx()
-    width = min(max(52, len(prompt) + 10, len(default) + 10), w - 4)
-    height = 5
-    y0 = max(0, (h - height) // 2)
-    x0 = max(0, (w - width) // 2)
-    win = curses.newwin(height, width, y0, x0)
-    win.keypad(True)
-    text = default
-    curses.curs_set(1)
-    result = None
-    try:
-        while True:
-            win.bkgd(" ", cp("card"))
-            win.erase()
-            win.attron(cp("border"))
-            win.box()
-            win.attroff(cp("border"))
-            win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4,
-                        cp("card_accent") | curses.A_BOLD)
-            win.addnstr(1, 3, short(prompt, width - 6), width - 6, cp("card_muted"))
-            field_width = max(4, width - 8)
-            shown = text[-field_width:] if len(text) > field_width else text
-            win.addnstr(2, 3, "› " + shown, field_width, cp("card"))
-            win.addnstr(height - 2, 3, "[Entrée] valider   [Échap] annuler",
-                        width - 6, cp("card_muted"))
-            try:
-                win.move(2, 5 + len(shown))
-            except curses.error:
-                pass
-            win.refresh()
-            try:
-                key = win.get_wch()
-            except curses.error:
-                continue
-            if key == "\x1b":
-                break
-            if key in ("\n", "\r", curses.KEY_ENTER):
-                result = text.strip()
-                break
-            if key in (curses.KEY_BACKSPACE, "\b", "\x7f", "\x08"):
-                text = text[:-1]
-                continue
-            if isinstance(key, str) and key.isprintable():
-                text += key
-    except KeyboardInterrupt:
-        result = None
-    finally:
-        curses.curs_set(0)
-    return result
+def dirty_name(line: str) -> str:
+    return line[3:] if len(line) > 3 else line
 
 
 def git_identity(cwd: Path) -> tuple[str, str]:
@@ -550,137 +361,53 @@ def is_moveable_script(path: Path) -> bool:
         return False
 
 
-def dirty_name(line: str) -> str:
-    return line[3:] if len(line) > 3 else line
-
-
-def commit_flow(stdscr, entry: Entry) -> str:
-    if not entry.dirty:
-        return "Aucune modification à commiter."
-    files = ", ".join(dirty_name(line) for line in entry.dirty)
-    more = f" (+{len(entry.dirty)} fichiers)" if len(entry.dirty) > 1 else ""
-    wrapped = textwrap.wrap(files, 54) or [""]
-    default_message = f"chore: mise à jour {datetime.now():%d/%m/%Y %H:%M}"
-    lines = [
-        f"{len(entry.dirty)} fichier(s) modifié(s)",
-        *wrapped[:3],
-        "",
-        f"Message : {default_message}",
-    ]
-    choice = dialog(
-        stdscr,
-        f"Commiter {entry.name} ?",
-        lines,
-        [("o", "Commiter et pousser"), ("m", "Changer le message"), ("n", "Annuler")],
-        default="n",
-    )
-    if choice is None or choice == "n":
-        return "Commit annulé."
-    message = default_message
-    if choice == "m":
-        edited = input_dialog(
-            stdscr, "Message de commit", "Message (vide = défaut) :", ""
-        )
-        if edited is None:
-            return "Commit annulé."
-        message = edited or message
-    show_progress(stdscr, f"Commit de {entry.name}…")
+def commit_repo(entry: Entry, message: str) -> tuple[bool, str]:
     ok, out = run(["git", "add", "-A"], entry.path, timeout=60)
     if not ok:
-        return f"Échec de git add : {out}"
+        return False, f"Échec de git add : {out}"
     ok, out = run(["git", "commit", "-m", message], entry.path, timeout=60)
     if not ok:
-        return f"Échec du commit : {out}"
+        return False, f"Échec du commit : {out}"
     if entry.upstream:
-        show_progress(stdscr, "Envoi vers le remote…")
         ok, out = run(["git", "push"], entry.path, timeout=120)
         if not ok:
-            return f"Commité, mais push échoué : {out}"
-        return f"{entry.name} commité et poussé."
+            return False, f"Commité, mais push échoué : {out}"
+        return True, f"{entry.name} commité et poussé."
     if entry.remote_url:
-        show_progress(stdscr, "Envoi vers le remote…")
         ok, out = run(
             ["git", "push", "-u", "origin", entry.branch], entry.path, timeout=120
         )
         if not ok:
-            return f"Commité, mais push échoué : {out}"
-        return f"{entry.name} commité et poussé."
-    return f"{entry.name} commité localement (aucun remote configuré)."
+            return False, f"Commité, mais push échoué : {out}"
+        return True, f"{entry.name} commité et poussé."
+    return True, f"{entry.name} commité localement (aucun remote configuré)."
 
 
-def move_script_flow(stdscr, entry: Entry) -> str:
-    source = entry.path
+def move_script(source: Path) -> tuple[bool, str]:
     destination = SCRIPTS_REPO / source.name
     if not SCRIPTS_REPO.is_dir():
-        return f"Dépôt introuvable : {SCRIPTS_REPO}"
+        return False, f"Dépôt introuvable : {SCRIPTS_REPO}"
     if destination.exists():
-        return f"Un fichier {source.name} existe déjà dans scripts-perso."
-    choice = dialog(
-        stdscr,
-        "Déplacer dans scripts-perso ?",
-        [
-            str(source),
-            f"Vers {destination}",
-            "Un lien symbolique sera laissé à l'emplacement actuel.",
-        ],
-        [("o", "Oui"), ("n", "Non")],
-        default="n",
-    )
-    if choice != "o":
-        return "Déplacement annulé."
-    show_progress(stdscr, f"Déplacement de {source.name}…")
+        return False, f"Un fichier {source.name} existe déjà dans scripts-perso."
     try:
         shutil.move(str(source), str(destination))
         os.symlink(destination, source)
     except OSError as exc:
-        return f"Échec du déplacement : {exc}"
+        return False, f"Échec du déplacement : {exc}"
     ok, out = run(["git", "add", "--", str(destination)], SCRIPTS_REPO, timeout=30)
     if not ok:
-        return f"Fichier déplacé, mais échec de git add : {out}"
+        return False, f"Fichier déplacé, mais échec de git add : {out}"
     ok, out = run(
         ["git", "commit", "-m", f"feat: ajout de {source.name}"],
         SCRIPTS_REPO,
         timeout=30,
     )
     if not ok:
-        return f"Fichier déplacé, mais échec du commit : {out}"
-    show_progress(stdscr, "Envoi vers GitHub…")
+        return False, f"Fichier déplacé, mais échec du commit : {out}"
     ok, out = run(["git", "push", "origin", "HEAD"], SCRIPTS_REPO, timeout=120)
     if not ok:
-        return f"Déplacé et commité, mais push échoué : {out}"
-    return f"{source.name} déplacé dans scripts-perso, commité et poussé."
-
-
-def create_flow(stdscr, entry: Entry) -> str:
-    if not entry.path.is_dir():
-        return "Seuls les dossiers peuvent être initialisés."
-    choice = dialog(
-        stdscr,
-        "Créer un dépôt git ?",
-        [str(entry.path), "Un premier commit sera créé."],
-        [("o", "Oui"), ("n", "Non")],
-        default="n",
-    )
-    if choice != "o":
-        return "Création annulée."
-    show_progress(stdscr, f"Initialisation de {entry.name}…")
-    ok, message = init_and_commit(entry.path)
-    if not ok:
-        return f"Échec : {message}"
-    choice = dialog(
-        stdscr,
-        "Publier sur GitHub ?",
-        [message, "Choisir la visibilité du dépôt distant."],
-        [("o", "Public"), ("p", "Privé"), ("n", "Local seulement")],
-        default="n",
-    )
-    if choice in ("o", "p"):
-        show_progress(stdscr, "Création du dépôt GitHub…")
-        ok, published = publish_repo(entry.path, entry.name, choice == "p")
-        if not ok:
-            return f"Dépôt local créé, publication échouée : {published}"
-        return published
-    return message
+        return False, f"Déplacé et commité, mais push échoué : {out}"
+    return True, f"{source.name} déplacé dans scripts-perso, commité et poussé."
 
 
 def print_report(entries: list[Entry]) -> int:
@@ -704,291 +431,744 @@ def print_report(entries: list[Entry]) -> int:
     return 0
 
 
-def build_columns(width: int) -> list[tuple[str, int]]:
-    if width >= 90:
-        cols = [("DÉPÔT", 22), ("BRANCHE", 12), ("ÉTAT", 18),
-                ("MODIFS", 7), ("COMMIT", 20)]
-    elif width >= 78:
-        cols = [("DÉPÔT", 20), ("BRANCHE", 10), ("ÉTAT", 18),
-                ("MODIFS", 7), ("COMMIT", 8)]
-    elif width >= 62:
-        cols = [("DÉPÔT", 18), ("ÉTAT", 17), ("MODIFS", 6), ("COMMIT", 8)]
-    else:
-        cols = [("DÉPÔT", 14), ("ÉTAT", 16), ("MODIFS", 5)]
-    used = sum(w for _label, w in cols)
-    cols.append(("MESSAGE", max(6, width - used)))
-    return cols
-
-
-def row_values(entry: Entry, full_commit: bool = False) -> dict[str, str]:
-    return {
-        "DÉPÔT": entry.name,
-        "BRANCHE": entry.branch or "-",
-        "ÉTAT": state_text(entry),
-        "MODIFS": str(len(entry.dirty)) if entry.is_repo else "-",
-        "COMMIT": fmt_commit(entry, full=full_commit),
-        "MESSAGE": entry.last_subject or "",
+def make_button(parent, text, command, kind="ghost"):
+    palette = {
+        "ghost": (CARD2, TEXT, "#25313d", "#ffffff"),
+        "accent": (ACCENT, "#0b0f13", "#6fd3ff", "#0b0f13"),
+        "danger": ("#3a1f24", "#ff9d9d", "#4a272e", "#ffb8b8"),
     }
-
-
-def draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, message):
-    h, w = stdscr.getmaxyx()
-    stdscr.erase()
-    if h < 10 or w < 50:
-        put(stdscr, 0, 0, "Terminal trop petit (min. 50x10)", cp("err"))
-        stdscr.refresh()
-        return selected, offset
-
-    repos = [e for e in entries if e.is_repo]
-    visible = visible_entries(entries, issues_only)
-    if visible:
-        selected = max(0, min(selected, len(visible) - 1))
-    else:
-        selected = 0
-
-    bad = problems(entries)
-    dirty_count = sum(1 for e in repos if e.dirty)
-
-    put(stdscr, 0, 1, "Moniteur de commits", cp("bg") | curses.A_BOLD)
-    if bad:
-        badge = f"● {len(bad)} à vérifier"
-        badge_pair = "err"
-    elif dirty_count:
-        badge = f"● {dirty_count} modif. locale(s)"
-        badge_pair = "warn"
-    else:
-        badge = "● tout est synchronisé"
-        badge_pair = "ok"
-    put(stdscr, 0, max(1, w - len(badge) - 2), badge, cp(badge_pair) | curses.A_BOLD)
-
-    subtitle = (
-        f"Dépôts et scripts locaux · scan {last_scan} · "
-        f"{len(repos)} dépôts · {duration:.1f}s"
+    bg, fg, active_bg, active_fg = palette.get(kind, palette["ghost"])
+    return tk.Button(
+        parent,
+        text=text,
+        command=command,
+        bg=bg,
+        fg=fg,
+        activebackground=active_bg,
+        activeforeground=active_fg,
+        relief="flat",
+        bd=0,
+        highlightthickness=0,
+        padx=14,
+        pady=7,
+        font=(FONT, 9),
+        cursor="hand2",
     )
-    put(stdscr, 1, 1, short(subtitle, w - 2), cp("muted"))
 
-    card_top, card_left, card_right = 2, 1, w - 2
-    detail_h = 7 if h >= 18 else 0
-    footer_y = h - 1
-    if detail_h:
-        detail_bottom = h - 2
-        detail_top = detail_bottom - detail_h + 1
-        card_bottom = detail_top - 1
-    else:
-        detail_top = detail_bottom = None
-        card_bottom = footer_y - 1
 
-    draw_box(stdscr, card_top, card_left, card_bottom, card_right)
-    inner_left = card_left + 2
-    inner_right = card_right - 2
-    inner_width = max(1, inner_right - inner_left + 1)
+class CommitMonitor(tk.Tk):
+    def __init__(self, roots):
+        super().__init__()
+        self.roots = roots
+        self.title("Moniteur de commits")
+        self._set_icon()
+        self.configure(bg=BG)
+        self.entries: list[Entry] = []
+        self.row_entries: dict[str, Entry] = {}
+        self.scanning = False
+        self.busy = False
+        self.pending_message = ""
+        self._after_id = None
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_args: self.populate())
+        self.issues_only = tk.BooleanVar(value=False)
+        self._build_style()
+        self._build_ui()
+        self.update_idletasks()
+        width = min(1280, self.winfo_screenwidth() - 60)
+        height = min(820, self.winfo_screenheight() - 90)
+        self.geometry(f"{width}x{height}")
+        self.minsize(1000, 660)
+        self._center(width, height)
+        self.bind("<F5>", lambda _event: self.refresh())
+        self.bind("<Control-r>", lambda _event: self.refresh())
+        self.bind("<Control-q>", lambda _event: self.destroy())
+        self.refresh()
 
-    cols = build_columns(inner_width)
-    header_y = card_top + 1
-    x = inner_left
-    for label, width in cols:
-        put(stdscr, header_y, x, short(label, width - 1), cp("card_muted") | curses.A_BOLD)
-        x += width
-    fill(stdscr, header_y + 1, inner_left, inner_right, "card_muted", "─")
+    def _set_icon(self):
+        try:
+            self._icon_image = tk.PhotoImage(file=str(ICON_PATH))
+            self.iconphoto(True, self._icon_image)
+        except Exception:
+            pass
 
-    rows_top = header_y + 2
-    rows = max(1, card_bottom - rows_top)
-    if selected < offset:
-        offset = selected
-    elif selected >= offset + rows:
-        offset = selected - rows + 1
+    def _center(self, width, height):
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2 - 20)
+        self.geometry(f"+{x}+{y}")
 
-    if visible:
-        for i, entry in enumerate(visible[offset : offset + rows]):
-            y = rows_top + i
-            is_selected = (offset + i) == selected
-            if is_selected:
-                fill(stdscr, y, inner_left, inner_right, "sel")
-                base = "sel"
-                colors = {
-                    "name": "sel", "muted": "sel", "state": "sel",
-                    "warn": "sel", "ok": "sel", "err": "sel",
-                }
-            else:
-                fill(stdscr, y, inner_left, inner_right, "card")
-                base = "card"
-                colors = {
-                    "name": "card", "muted": "card_muted", "state": "card",
-                    "warn": "card_warn", "ok": "card_ok", "err": "card_err",
-                }
-            pair_for = {
-                OK: colors["ok"], WARN: colors["warn"],
-                ERR: colors["err"], INFO: colors["name"], DIM: colors["muted"],
-            }[entry.color]
-            full_commit = next(
-                (width for label, width in cols if label == "COMMIT"), 8
-            ) >= 19
-            values = row_values(entry, full_commit)
-            x = inner_left
-            for label, width in cols:
-                value = values[label]
-                if is_selected:
-                    pair = "sel"
-                elif label == "DÉPÔT":
-                    pair = "card"
-                elif label == "ÉTAT":
-                    pair = pair_for
-                elif label == "MODIFS":
-                    pair = "card_warn" if entry.dirty else "card_muted"
-                elif label == "BRANCHE":
-                    pair = "card_muted"
-                elif label == "COMMIT":
-                    pair = "card_muted"
+    def _build_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.table_font = tkfont.Font(family=FONT, size=9)
+        self.table_head_font = tkfont.Font(family=FONT, size=9, weight="bold")
+        row_height = self.table_font.metrics("linespace") + 12
+
+        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.configure(
+            "Treeview",
+            background=CARD2,
+            fieldbackground=CARD2,
+            foreground=TEXT,
+            borderwidth=0,
+            rowheight=row_height,
+            font=self.table_font,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#2b4354")],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=CARD,
+            foreground=MUTED,
+            relief="flat",
+            borderwidth=0,
+            font=self.table_head_font,
+            padding=(8, 7),
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", CARD)],
+            foreground=[("active", TEXT)],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background="#2a3540",
+            troughcolor=CARD2,
+            bordercolor=CARD2,
+            arrowcolor=MUTED,
+            darkcolor="#2a3540",
+            lightcolor="#2a3540",
+            relief="flat",
+        )
+        style.map("Vertical.TScrollbar", background=[("active", "#3a4855")])
+        style.configure(
+            "Dark.TEntry",
+            fieldbackground=CARD2,
+            foreground=TEXT,
+            insertcolor=TEXT,
+            bordercolor=CARD2,
+            lightcolor=CARD2,
+            darkcolor=CARD2,
+            padding=6,
+        )
+        style.map(
+            "Dark.TEntry",
+            bordercolor=[("focus", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            darkcolor=[("focus", ACCENT)],
+        )
+        style.configure(
+            "Ghost.TButton",
+            background=CARD2,
+            foreground=TEXT,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(12, 6),
+            font=(FONT, 9),
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", "#25313d"), ("pressed", "#2c3a47")],
+        )
+
+    def _stat_card(self, parent):
+        card = tk.Frame(parent, bg=CARD)
+        tk.Label(
+            card, text="", bg=CARD, fg=MUTED, font=(FONT, 8, "bold"), anchor="w",
+        ).pack(anchor="w", padx=16, pady=(12, 0))
+        value = tk.Label(
+            card, text="—", bg=CARD, fg=TEXT, font=(FONT, 22, "bold"), anchor="w",
+        )
+        value.pack(anchor="w", padx=16, pady=(0, 12))
+        return card, card.winfo_children()[0], value
+
+    def _build_ui(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        header = tk.Frame(self, bg=BG)
+        header.grid(row=0, column=0, sticky="ew", padx=22, pady=(16, 10))
+        header.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            header, text="Moniteur de commits", bg=BG, fg=TEXT,
+            font=(FONT, 20, "bold"), anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.subtitle = tk.Label(
+            header,
+            text="Dépôts git et scripts locaux · vérification des commits et du remote",
+            bg=BG, fg=MUTED, font=(FONT, 9), anchor="w",
+        )
+        self.subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.live_label = tk.Label(
+            header, text="●  CONNEXION…", bg=BG, fg=MUTED,
+            font=(FONT, 9, "bold"), anchor="e",
+        )
+        self.live_label.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 12))
+        for column in range(4):
+            cards.grid_columnconfigure(column, weight=1, uniform="stats")
+
+        repo_card, repo_label, self.repo_value = self._stat_card(cards)
+        repo_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        repo_label.configure(text="DÉPÔTS SUIVIS")
+        ok_card, ok_label, self.ok_value = self._stat_card(cards)
+        ok_card.grid(row=0, column=1, sticky="nsew", padx=6)
+        ok_label.configure(text="À JOUR")
+        self.ok_value.configure(fg=GREEN)
+        issue_card, issue_label, self.issue_value = self._stat_card(cards)
+        issue_card.grid(row=0, column=2, sticky="nsew", padx=6)
+        issue_label.configure(text="À VÉRIFIER")
+        self.issue_value.configure(fg=RED)
+        dirty_card, dirty_label, self.dirty_value = self._stat_card(cards)
+        dirty_card.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
+        dirty_label.configure(text="MODIFS LOCALES")
+        self.dirty_value.configure(fg=ORANGE)
+
+        main_card = tk.Frame(self, bg=CARD)
+        main_card.grid(row=2, column=0, sticky="nsew", padx=22, pady=(0, 16))
+        main_card.grid_columnconfigure(0, weight=1)
+        main_card.grid_rowconfigure(1, weight=1)
+
+        toolbar = tk.Frame(main_card, bg=CARD)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 8))
+        toolbar.grid_columnconfigure(1, weight=1)
+
+        heading = tk.Frame(toolbar, bg=CARD)
+        heading.grid(row=0, column=0, sticky="w")
+        tk.Label(
+            heading, text="Dépôts et scripts", bg=CARD, fg=TEXT,
+            font=(FONT, 11, "bold"),
+        ).pack(side="left")
+        self.scan_label = tk.Label(
+            heading, text="", bg=CARD, fg=MUTED, font=(FONT, 9),
+        )
+        self.scan_label.pack(side="left", padx=(10, 0))
+
+        controls = tk.Frame(toolbar, bg=CARD)
+        controls.grid(row=0, column=2, sticky="e")
+        tk.Label(
+            controls, text="Filtrer", bg=CARD, fg=MUTED, font=(FONT, 9),
+        ).pack(side="left", padx=(10, 6))
+        self.filter_entry = ttk.Entry(
+            controls, textvariable=self.filter_var, width=20, style="Dark.TEntry",
+        )
+        self.filter_entry.pack(side="left")
+        self.issues_check = tk.Checkbutton(
+            controls, text="Problèmes", variable=self.issues_only,
+            command=self.populate, bg=CARD, fg=MUTED,
+            activebackground=CARD, activeforeground=TEXT,
+            selectcolor=CARD2, bd=0, highlightthickness=0,
+            font=(FONT, 9), cursor="hand2",
+        )
+        self.issues_check.pack(side="left", padx=(10, 4))
+        self.refresh_button = ttk.Button(
+            controls, text="Actualiser", style="Ghost.TButton", command=self.refresh,
+        )
+        self.refresh_button.pack(side="left", padx=(6, 0))
+
+        table_frame = tk.Frame(main_card, bg=CARD)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=16)
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+
+        columns = ("name", "branch", "state", "dirty", "commit", "message")
+        self.tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", selectmode="browse",
+        )
+        headings = {
+            "name": ("Dépôt", "w", 260),
+            "branch": ("Branche", "w", 110),
+            "state": ("État", "w", 180),
+            "dirty": ("Modifs", "center", 80),
+            "commit": ("Dernier commit", "w", 200),
+            "message": ("Message", "w", 360),
+        }
+        for column, (label, anchor, width) in headings.items():
+            self.tree.heading(column, text=label, anchor=anchor)
+            self.tree.column(
+                column, width=width, minwidth=width,
+                stretch=column in ("name", "message"), anchor=anchor,
+            )
+        self.tree.tag_configure("even", background=CARD2)
+        self.tree.tag_configure("odd", background=ROW_ALT)
+        self.tree.tag_configure("ok", foreground=GREEN)
+        self.tree.tag_configure("warn", foreground=ORANGE)
+        self.tree.tag_configure("err", foreground=RED)
+        self.tree.tag_configure("muted", foreground=MUTED)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self.update_detail())
+        self.tree.bind("<Double-1>", lambda _event: self.primary_action())
+
+        scrollbar = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.tree.yview,
+            style="Vertical.TScrollbar",
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        detail = tk.Frame(main_card, bg=CARD)
+        detail.grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 0))
+        detail.grid_columnconfigure(0, weight=1)
+        tk.Frame(detail, bg=CARD2, height=1).grid(row=0, column=0, sticky="ew")
+        self.detail_path = tk.Label(
+            detail, text="Sélectionne un dépôt", bg=CARD, fg=ACCENT,
+            font=(FONT, 9, "bold"), anchor="w",
+        )
+        self.detail_path.grid(row=1, column=0, sticky="w", pady=(10, 2))
+        self.detail_info = tk.Label(
+            detail, text="", bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w",
+            justify="left", wraplength=1100,
+        )
+        self.detail_info.grid(row=2, column=0, sticky="w")
+        self.detail_commit = tk.Label(
+            detail, text="", bg=CARD, fg=TEXT, font=(FONT, 9), anchor="w",
+            justify="left", wraplength=1100,
+        )
+        self.detail_commit.grid(row=3, column=0, sticky="w", pady=(2, 0))
+        self.detail_dirty = tk.Label(
+            detail, text="", bg=CARD, fg=ORANGE, font=(FONT, 9), anchor="w",
+            justify="left", wraplength=1100,
+        )
+        self.detail_dirty.grid(row=4, column=0, sticky="w", pady=(2, 0))
+
+        footer = tk.Frame(main_card, bg=CARD)
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 12))
+        footer.grid_columnconfigure(0, weight=1)
+        self.status_label = tk.Label(
+            footer, text="", bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w",
+        )
+        self.status_label.grid(row=0, column=0, sticky="w")
+
+        actions = tk.Frame(footer, bg=CARD)
+        actions.grid(row=0, column=1, sticky="e")
+        self.btn_commit = make_button(
+            actions, "Commiter et pousser", self.action_commit, "accent"
+        )
+        self.btn_create = make_button(
+            actions, "Créer le dépôt", self.action_create, "accent"
+        )
+        self.btn_move = make_button(
+            actions, "Déplacer vers scripts-perso", self.action_move, "ghost"
+        )
+
+        self._after_id = self.after(300000, self._auto_refresh)
+
+    def _auto_refresh(self):
+        if not self.scanning and not self.busy:
+            self.refresh()
+        self._after_id = self.after(300000, self._auto_refresh)
+
+    def refresh(self):
+        if self.scanning or self.busy:
+            return
+        self.scanning = True
+        self.live_label.configure(text="●  SCAN…", fg=MUTED)
+        self.refresh_button.state(["disabled"])
+        start = time.monotonic()
+
+        def work():
+            entries = discover(self.roots)
+            duration = time.monotonic() - start
+
+            def apply():
+                self.scanning = False
+                self.refresh_button.state(["!disabled"])
+                self.entries = entries
+                self.scan_label.configure(
+                    text=f"dernier scan {datetime.now():%H:%M:%S} · {duration:.1f}s"
+                )
+                if self.pending_message:
+                    self.status_label.configure(text=self.pending_message, fg=MUTED)
+                    self.pending_message = ""
                 else:
-                    pair = "card_muted"
-                put(stdscr, y, x, short(value, width - 1), cp(pair), width - 1)
-                x += width
-    else:
-        put(stdscr, rows_top + 1, inner_left + 2, "Aucun dépôt à afficher.",
-            cp("card_muted"))
+                    bad = len(problems(entries))
+                    dirty = sum(1 for e in entries if e.is_repo and e.dirty)
+                    status = f"{bad} dépôt(s) à vérifier"
+                    if dirty:
+                        status += f" · {dirty} avec modifs locales"
+                    self.status_label.configure(text=status, fg=MUTED)
+                self.update_summary()
+                self.populate()
 
-    if detail_h and visible:
-        entry = visible[selected]
-        draw_box(stdscr, detail_top, card_left, detail_bottom, card_right)
-        for line_y in range(detail_top + 1, detail_bottom):
-            fill(stdscr, line_y, inner_left, inner_right, "card")
-        y = detail_top + 1
-        put(stdscr, y, inner_left, "▸ ", cp("card_accent") | curses.A_BOLD)
-        put(stdscr, y, inner_left + 2, short(str(entry.path), inner_width - 2),
-            cp("card_accent"))
-        y += 1
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_summary(self):
+        repos = [e for e in self.entries if e.is_repo]
+        bad = problems(self.entries)
+        dirty = [e for e in repos if e.dirty]
+        good = [e for e in repos if e not in bad]
+        self.repo_value.configure(text=str(len(repos)))
+        self.ok_value.configure(text=str(len(good)))
+        self.issue_value.configure(text=str(len(bad)))
+        self.dirty_value.configure(text=str(len(dirty)))
+        if bad:
+            self.live_label.configure(text=f"●  {len(bad)} À VÉRIFIER", fg=RED)
+        elif dirty:
+            self.live_label.configure(
+                text=f"●  {len(dirty)} MODIF. LOCALE(S)", fg=ORANGE
+            )
+        else:
+            self.live_label.configure(text="●  SYNCHRONISÉ", fg=GREEN)
+
+    def filtered_entries(self) -> list[Entry]:
+        entries = self.entries
+        if self.issues_only.get():
+            entries = [
+                e for e in entries
+                if e.is_repo and (e.behind or not e.fetch_ok or not e.upstream
+                                  or e.ahead or e.dirty)
+            ]
+        text = self.filter_var.get().strip().lower()
+        if text:
+            entries = [
+                e for e in entries
+                if text in e.name.lower()
+                or text in str(e.path).lower()
+                or text in state_text(e).lower()
+                or text in e.last_subject.lower()
+                or text in e.branch.lower()
+            ]
+        return entries
+
+    def populate(self):
+        selected_path = self.selected_entry().path if self.selected_entry() else None
+        self.tree.delete(*self.tree.get_children())
+        self.row_entries.clear()
+        for index, entry in enumerate(self.filtered_entries()):
+            tag = {OK: "ok", WARN: "warn", ERR: "err", DIM: "muted",
+                   INFO: "muted"}[entry.color]
+            values = (
+                entry.name,
+                entry.branch or "-",
+                state_text(entry),
+                str(len(entry.dirty)) if entry.is_repo else "-",
+                fmt_commit(entry),
+                entry.last_subject or "",
+            )
+            iid = self.tree.insert(
+                "", "end", values=values,
+                tags=("even" if index % 2 == 0 else "odd", tag),
+            )
+            self.row_entries[iid] = entry
+        children = self.tree.get_children()
+        target = None
+        if selected_path:
+            for iid, entry in self.row_entries.items():
+                if entry.path == selected_path:
+                    target = iid
+                    break
+        if target is None and children:
+            target = children[0]
+        if target:
+            self.tree.selection_set(target)
+            self.tree.focus(target)
+            self.tree.see(target)
+        self.update_detail()
+
+    def selected_entry(self) -> Entry | None:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        return self.row_entries.get(selection[0])
+
+    def update_detail(self):
+        entry = self.selected_entry()
+        for button in (self.btn_commit, self.btn_create, self.btn_move):
+            button.pack_forget()
+        if entry is None:
+            self.detail_path.configure(text="Sélectionne un dépôt", fg=MUTED)
+            self.detail_info.configure(text="")
+            self.detail_commit.configure(text="")
+            self.detail_dirty.configure(text="")
+            return
+        self.detail_path.configure(text=str(entry.path), fg=ACCENT)
         if entry.is_repo:
-            line = f"Remote  {entry.remote_url or '-'}"
-            if entry.upstream:
-                line += f"   ·   Suivi  {entry.upstream}"
-            line += f"   ·   Écart  {entry.ahead}↑ {entry.behind}↓"
-            put(stdscr, y, inner_left, short(line, inner_width), cp("card_muted"))
-            y += 1
-            commit = "-"
+            info = f"Remote  {entry.remote_url or 'aucun'}"
+            info += f"   ·   Suivi  {entry.upstream or 'aucun'}"
+            info += f"   ·   Écart  {entry.ahead}↑ {entry.behind}↓"
+            self.detail_info.configure(text=info)
             if entry.last_hash:
                 commit = (
                     f"{entry.last_hash}  ·  {entry.last_date}  ·  "
                     f"{entry.last_author} — {entry.last_subject}"
                 )
-            put(stdscr, y, inner_left, short(commit, inner_width), cp("card"))
-            y += 1
+            else:
+                commit = "Aucun commit"
+            self.detail_commit.configure(text=commit)
             if entry.dirty:
-                names = ", ".join(dirty_name(line) for line in entry.dirty[:4])
-                more = " …" if len(entry.dirty) > 4 else ""
-                put(stdscr, y, inner_left,
-                    short(f"Modifs   {len(entry.dirty)} fichier(s) : {names}{more}",
-                          inner_width),
-                    cp("card_warn"))
+                names = ", ".join(dirty_name(line) for line in entry.dirty[:5])
+                more = " …" if len(entry.dirty) > 5 else ""
+                self.detail_dirty.configure(
+                    text=f"Modifs  {len(entry.dirty)} fichier(s) : {names}{more}",
+                    fg=ORANGE,
+                )
+                self.btn_commit.pack(side="left", padx=(0, 6))
             elif not entry.fetch_ok:
-                put(stdscr, y, inner_left, short(f"Erreur   {entry.fetch_error}",
-                                                inner_width), cp("card_err"))
+                self.detail_dirty.configure(
+                    text=f"Erreur  {entry.fetch_error}", fg=RED
+                )
             else:
-                put(stdscr, y, inner_left, "Modifs   aucune", cp("card_muted"))
+                self.detail_dirty.configure(text="Modifs  aucune", fg=MUTED)
         else:
+            self.detail_info.configure(text="Aucun suivi de commits pour cette entrée")
+            self.detail_commit.configure(text="")
             if entry.path.is_dir():
-                hint = "Pas un dépôt git — c pour l'initialiser."
+                self.detail_dirty.configure(
+                    text="Pas un dépôt git — tu peux l'initialiser.", fg=MUTED
+                )
+                self.btn_create.pack(side="left", padx=(0, 6))
             elif is_moveable_script(entry.path):
-                hint = "Script hors git — c pour le déplacer dans scripts-perso."
+                self.detail_dirty.configure(
+                    text="Script hors git — tu peux le déplacer dans scripts-perso.",
+                    fg=MUTED,
+                )
+                self.btn_move.pack(side="left", padx=(0, 6))
             else:
-                hint = "Fichier hors git — déplacement non proposé."
-            put(stdscr, y, inner_left, short(hint, inner_width), cp("card_muted"))
-        put(stdscr, detail_bottom - 1, inner_left, short(message, inner_width),
-            cp("card_muted"))
+                self.detail_dirty.configure(
+                    text="Fichier hors git — déplacement non proposé.", fg=MUTED
+                )
 
-    fill(stdscr, footer_y, 0, w - 2, "bar")
-    hints = [
-        ("↑↓", "naviguer"), ("r", "rafraîchir"), ("f", "filtre"),
-        ("c", "commiter / créer"), ("q", "quitter"),
-    ]
-    x = 1
-    for key, label in hints:
-        if x >= w - 2:
-            break
-        put(stdscr, footer_y, x, key, cp("bar_key") | curses.A_BOLD)
-        x += len(key) + 1
-        put(stdscr, footer_y, x, label, cp("bar"))
-        x += len(label) + 3
-    if issues_only and w > 60:
-        badge = " filtre problèmes "
-        put(stdscr, footer_y, w - len(badge) - 2, badge,
-            cp("bar_key") | curses.A_BOLD)
+    def primary_action(self):
+        entry = self.selected_entry()
+        if entry is None:
+            return
+        if entry.is_repo and entry.dirty:
+            self.action_commit()
+        elif not entry.is_repo and entry.path.is_dir():
+            self.action_create()
+        elif is_moveable_script(entry.path):
+            self.action_move()
 
-    stdscr.refresh()
-    return selected, offset
+    def set_busy(self, text: str | None):
+        self.busy = bool(text)
+        if text:
+            self.live_label.configure(text=f"●  {text}", fg=MUTED)
+            self.refresh_button.state(["disabled"])
+        else:
+            self.refresh_button.state(["!disabled"])
 
+    def run_async(self, work, done):
+        def runner():
+            try:
+                result = work()
+            except Exception as exc:
+                result = (False, str(exc))
+            self.after(0, lambda: done(result))
 
-def run_tui(stdscr, roots: list[tuple[Path, bool]]):
-    curses.curs_set(0)
-    setup_colors()
-    try:
-        stdscr.bkgd(" ", cp("bg"))
-    except curses.error:
-        pass
-    stdscr.keypad(True)
+        threading.Thread(target=runner, daemon=True).start()
 
-    entries: list[Entry] = []
-    selected = 0
-    offset = 0
-    issues_only = False
-    message = "Scan en cours…"
-    last_scan = "-"
-    duration = 0.0
+    def ask(self, title, lines, options, width=560):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=CARD)
+        win.transient(self)
+        win.resizable(False, False)
+        result = {"value": None}
 
-    def refresh():
-        nonlocal entries, last_scan, duration, message
-        message = "Scan en cours…"
-        draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, message)
-        start = time.monotonic()
-        entries = discover(roots)
-        duration = time.monotonic() - start
-        last_scan = datetime.now().strftime("%H:%M:%S")
-        message = f"{len(problems(entries))} dépôt(s) à vérifier"
+        body = tk.Frame(win, bg=CARD, padx=22, pady=18)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body, text=title, bg=CARD, fg=TEXT, font=(FONT, 12, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        for line in lines:
+            tk.Label(
+                body, text=line, bg=CARD, fg=MUTED, font=(FONT, 9),
+                anchor="w", justify="left", wraplength=width - 44,
+            ).pack(anchor="w", pady=(6, 0))
+        buttons = tk.Frame(body, bg=CARD)
+        buttons.pack(fill="x", pady=(18, 0))
 
-    refresh()
-    while True:
-        selected, offset = draw(
-            stdscr, entries, selected, offset, last_scan, duration, issues_only, message
+        def choose(value):
+            result["value"] = value
+            win.destroy()
+
+        for key, label, kind in reversed(options):
+            make_button(
+                buttons, label, lambda v=key: choose(v), kind
+            ).pack(side="right", padx=(8, 0))
+
+        win.bind("<Escape>", lambda _event: choose(None))
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.grab_set()
+        win.focus_force()
+        self.wait_window(win)
+        return result["value"]
+
+    def show_message(self, title, lines, error=False):
+        self.ask(
+            title,
+            lines,
+            [("ok", "Fermer", "danger" if error else "ghost")],
+            width=560,
         )
-        try:
-            key = stdscr.getch()
-        except KeyboardInterrupt:
-            break
-        if key in (ord("q"), ord("Q"), 27):
-            break
-        if key in (curses.KEY_UP, ord("k")):
-            selected = max(0, selected - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            selected += 1
-        elif key in (curses.KEY_HOME, ord("g")):
-            selected = 0
-        elif key in (curses.KEY_END, ord("G")):
-            selected = 10**6
-        elif key in (ord("r"), ord("R"), curses.KEY_RESIZE):
-            refresh()
-        elif key in (ord("f"), ord("F")):
-            issues_only = not issues_only
-            selected = 0
-            offset = 0
-        elif key in (ord("c"), ord("C")):
-            visible = visible_entries(entries, issues_only)
-            if not visible:
-                message = "Aucune entrée sélectionnée."
-                continue
-            entry = visible[min(selected, len(visible) - 1)]
-            if entry.is_repo:
-                if not entry.dirty:
-                    message = f"{entry.name} n'a aucune modification à commiter."
-                    continue
-                result = commit_flow(stdscr, entry)
-            elif entry.path.is_dir():
-                result = create_flow(stdscr, entry)
-            elif is_moveable_script(entry.path):
-                result = move_script_flow(stdscr, entry)
+
+    def ask_commit(self, entry: Entry) -> str | None:
+        win = tk.Toplevel(self)
+        win.title(f"Commiter {entry.name}")
+        win.configure(bg=CARD)
+        win.transient(self)
+        win.resizable(False, False)
+        result = {"value": None}
+        default = f"chore: mise à jour {datetime.now():%d/%m/%Y %H:%M}"
+
+        body = tk.Frame(win, bg=CARD, padx=22, pady=18)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body, text=f"Commiter {entry.name}", bg=CARD, fg=TEXT,
+            font=(FONT, 12, "bold"), anchor="w",
+        ).pack(anchor="w")
+        files = ", ".join(dirty_name(line) for line in entry.dirty[:6])
+        more = " …" if len(entry.dirty) > 6 else ""
+        tk.Label(
+            body, text=f"{len(entry.dirty)} fichier(s) : {files}{more}",
+            bg=CARD, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(6, 0))
+        tk.Label(
+            body, text="Message de commit", bg=CARD, fg=MUTED, font=(FONT, 9),
+            anchor="w",
+        ).pack(anchor="w", pady=(14, 4))
+        message_var = tk.StringVar(value=default)
+        message_entry = ttk.Entry(
+            body, textvariable=message_var, style="Dark.TEntry", width=52,
+        )
+        message_entry.pack(fill="x")
+        buttons = tk.Frame(body, bg=CARD)
+        buttons.pack(fill="x", pady=(18, 0))
+
+        def commit():
+            result["value"] = message_var.get().strip() or default
+            win.destroy()
+
+        make_button(buttons, "Commiter et pousser", commit, "accent").pack(
+            side="right"
+        )
+        make_button(buttons, "Annuler", win.destroy, "ghost").pack(
+            side="right", padx=(8, 0)
+        )
+        win.bind("<Escape>", lambda _event: win.destroy())
+        message_entry.bind("<Return>", lambda _event: commit())
+        message_entry.focus_set()
+        message_entry.selection_range(0, "end")
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.grab_set()
+        win.focus_force()
+        self.wait_window(win)
+        return result["value"]
+
+    def action_commit(self):
+        entry = self.selected_entry()
+        if entry is None or not entry.is_repo or not entry.dirty:
+            return
+        message = self.ask_commit(entry)
+        if not message:
+            return
+        self.set_busy(f"COMMIT {entry.name}…")
+
+        def done(result):
+            ok, text = result
+            self.set_busy(None)
+            if not ok:
+                self.show_message("Échec du commit", [text], error=True)
+            self.pending_message = text
+            self.refresh()
+
+        self.run_async(lambda: commit_repo(entry, message), done)
+
+    def action_create(self):
+        entry = self.selected_entry()
+        if entry is None or entry.is_repo or not entry.path.is_dir():
+            return
+        choice = self.ask(
+            "Créer un dépôt git ?",
+            [str(entry.path), "Un premier commit sera créé."],
+            [("n", "Annuler", "ghost"), ("o", "Créer", "accent")],
+        )
+        if choice != "o":
+            return
+        self.set_busy(f"INIT {entry.name}…")
+
+        def done(result):
+            ok, text = result
+            self.set_busy(None)
+            if not ok:
+                self.show_message("Échec de l'initialisation", [text], error=True)
+                self.refresh()
+                return
+            visibility = self.ask(
+                "Publier sur GitHub ?",
+                [text, "Choisir la visibilité du dépôt distant."],
+                [("n", "Local seulement", "ghost"),
+                 ("p", "Privé", "ghost"),
+                 ("o", "Public", "accent")],
+            )
+            if visibility in ("o", "p"):
+                self.set_busy("PUBLICATION…")
+
+                def published(result2):
+                    ok2, text2 = result2
+                    self.set_busy(None)
+                    if not ok2:
+                        self.show_message(
+                            "Publication impossible", [text2], error=True
+                        )
+                    self.pending_message = text2
+                    self.refresh()
+
+                self.run_async(
+                    lambda: publish_repo(entry.path, entry.name, visibility == "p"),
+                    published,
+                )
             else:
-                message = "Ce fichier n'est pas un script déplaçable."
-                continue
-            refresh()
-            message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
+                self.pending_message = text
+                self.refresh()
+
+        self.run_async(lambda: init_and_commit(entry.path), done)
+
+    def action_move(self):
+        entry = self.selected_entry()
+        if entry is None or entry.is_repo or not is_moveable_script(entry.path):
+            return
+        choice = self.ask(
+            "Déplacer dans scripts-perso ?",
+            [
+                str(entry.path),
+                f"Vers {SCRIPTS_REPO / entry.name}",
+                "Un lien symbolique sera laissé à l'emplacement actuel.",
+            ],
+            [("n", "Annuler", "ghost"), ("o", "Déplacer", "accent")],
+        )
+        if choice != "o":
+            return
+        self.set_busy(f"DÉPLACEMENT {entry.name}…")
+
+        def done(result):
+            ok, text = result
+            self.set_busy(None)
+            if not ok:
+                self.show_message("Échec du déplacement", [text], error=True)
+            self.pending_message = text
+            self.refresh()
+
+        self.run_async(lambda: move_script(entry.path), done)
 
 
 def main() -> int:
@@ -1008,12 +1188,14 @@ def main() -> int:
     roots = [(Path(p), repos_only) for p, repos_only in DEFAULT_ROOTS]
     roots += [(Path(p), False) for p in (args.roots or [])]
 
-    if args.once or not sys.stdout.isatty():
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if args.once or not has_display:
         locale.setlocale(locale.LC_ALL, "")
         return print_report(discover(roots))
 
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(run_tui, roots)
+    app = CommitMonitor(roots)
+    app.mainloop()
     return 0
 
 
