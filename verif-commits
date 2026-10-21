@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Vérificateur de commits pour les projets et scripts locaux.
-
-Interface terminal interactive : scanne les dépôts git, récupère les
-changements distants (fetch) et signale ceux qui ne sont pas à jour.
-"""
+"""Moniteur de commits : vérifie, commit et publie les dépôts locaux."""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -38,6 +35,7 @@ GIT_ENV = {
 }
 
 OK, WARN, ERR, INFO, DIM = 1, 2, 3, 4, 5
+PAIRS: dict[str, int] = {}
 
 
 @dataclass
@@ -177,7 +175,6 @@ def scan_entry(path: Path) -> Entry:
 
 
 def find_repos(root: Path, max_depth: int = 4) -> list[Path]:
-    """Trouve les dépôts git sous root sans descendre dans les dépôts trouvés."""
     found: list[Path] = []
     base_depth = len(root.parts)
     for current, dirs, _files in os.walk(root):
@@ -244,10 +241,12 @@ def discover(roots: list[tuple[Path, bool]]) -> list[Entry]:
     return entries
 
 
-def fmt_commit(entry: Entry) -> str:
+def fmt_commit(entry: Entry, full: bool = True) -> str:
     if not entry.is_repo or not entry.last_hash:
         return "-"
-    return f"{entry.last_hash} {entry.last_date}"
+    if full and entry.last_date:
+        return f"{entry.last_hash} {entry.last_date}"
+    return entry.last_hash
 
 
 def short(text: str, width: int) -> str:
@@ -275,13 +274,123 @@ def visible_entries(entries: list[Entry], issues_only: bool) -> list[Entry]:
     return [e for e in entries if e.is_repo] + [e for e in entries if not e.is_repo]
 
 
+def state_text(entry: Entry) -> str:
+    if not entry.is_repo:
+        return "○ hors git"
+    if not entry.fetch_ok:
+        return "✕ erreur fetch"
+    if not entry.upstream:
+        return "○ sans remote"
+    if entry.ahead and entry.behind:
+        return f"◆ {entry.ahead}↑ {entry.behind}↓"
+    if entry.behind:
+        return f"↓ {entry.behind} en retard"
+    if entry.ahead:
+        return f"↑ {entry.ahead} en avance"
+    return "✓ à jour"
+
+
+def cp(name: str) -> int:
+    return curses.color_pair(PAIRS[name])
+
+
+def setup_colors() -> None:
+    if not curses.has_colors():
+        for name in (
+            "bg", "muted", "accent", "ok", "warn", "err", "border",
+            "card", "card_muted", "card_accent", "card_ok", "card_warn",
+            "card_err", "sel", "bar", "bar_key",
+        ):
+            PAIRS[name] = 0
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        default = -1
+    except curses.error:
+        default = curses.COLOR_BLACK
+
+    if curses.COLORS >= 256:
+        bg, card, card2, text = 234, 235, 237, 255
+        muted, accent, green, orange, red = 244, 81, 79, 214, 203
+    else:
+        bg = card = card2 = default
+        text = muted = curses.COLOR_WHITE
+        accent = curses.COLOR_CYAN
+        green = curses.COLOR_GREEN
+        orange = curses.COLOR_YELLOW
+        red = curses.COLOR_RED
+
+    specs = {
+        "bg": (text, bg),
+        "muted": (muted, bg),
+        "accent": (accent, bg),
+        "ok": (green, bg),
+        "warn": (orange, bg),
+        "err": (red, bg),
+        "border": (card2, bg),
+        "card": (text, card),
+        "card_muted": (muted, card),
+        "card_accent": (accent, card),
+        "card_ok": (green, card),
+        "card_warn": (orange, card),
+        "card_err": (red, card),
+        "sel": (bg, accent),
+        "bar": (muted, card2),
+        "bar_key": (text, card2),
+    }
+    for index, (name, (fg, bkg)) in enumerate(specs.items(), start=1):
+        try:
+            curses.init_pair(index, fg, bkg)
+            PAIRS[name] = index
+        except curses.error:
+            PAIRS[name] = 0
+
+
+def put(scr, y: int, x: int, text: str, attr: int, width: int | None = None) -> None:
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w or not text:
+        return
+    limit = max(0, w - x - 1)
+    if width is not None:
+        limit = min(limit, width)
+    try:
+        scr.addnstr(y, x, text, limit, attr)
+    except curses.error:
+        pass
+
+
+def fill(scr, y: int, x1: int, x2: int, pair: str, char: str = " ") -> None:
+    if x2 < x1:
+        return
+    put(scr, y, x1, char * (x2 - x1 + 1), cp(pair), x2 - x1 + 1)
+
+
+def draw_box(scr, top: int, left: int, bottom: int, right: int) -> None:
+    if bottom <= top or right <= left:
+        return
+    attr = cp("border")
+    try:
+        scr.attron(attr)
+        for x in range(left + 1, right):
+            scr.addch(top, x, curses.ACS_HLINE)
+            scr.addch(bottom, x, curses.ACS_HLINE)
+        for y in range(top + 1, bottom):
+            scr.addch(y, left, curses.ACS_VLINE)
+            scr.addch(y, right, curses.ACS_VLINE)
+        scr.addch(top, left, curses.ACS_ULCORNER)
+        scr.addch(top, right, curses.ACS_URCORNER)
+        scr.addch(bottom, left, curses.ACS_LLCORNER)
+        scr.addch(bottom, right, curses.ACS_LRCORNER)
+        scr.attroff(attr)
+    except curses.error:
+        pass
+
+
 def show_progress(stdscr, text: str) -> None:
     h, w = stdscr.getmaxyx()
     stdscr.erase()
-    stdscr.addnstr(
-        h // 2, max(0, (w - len(text)) // 2), short(text, w - 1), w - 1,
-        curses.A_BOLD,
-    )
+    put(stdscr, h // 2, max(0, (w - len(text)) // 2), text, cp("accent") | curses.A_BOLD)
     stdscr.refresh()
 
 
@@ -289,23 +398,23 @@ def dialog(stdscr, title: str, lines: list[str], options: list[tuple[str, str]],
            default: str | None = None) -> str | None:
     h, w = stdscr.getmaxyx()
     hint = "  ".join(f"[{key.upper()}] {label}" for key, label in options)
-    width = max(
-        [len(title) + 6, len(hint) + 4] + [len(line) + 6 for line in lines]
-    )
-    width = min(max(width, 34), w - 4)
-    height = min(len(lines) + 4, h - 2)
+    width = max([len(title) + 8, len(hint) + 6] + [len(line) + 8 for line in lines])
+    width = min(max(width, 38), w - 4)
+    height = min(len(lines) + 5, h - 2)
     y0 = max(0, (h - height) // 2)
     x0 = max(0, (w - width) // 2)
     win = curses.newwin(height, width, y0, x0)
     win.keypad(True)
+    win.bkgd(" ", cp("card"))
     win.erase()
+    win.attron(cp("border"))
     win.box()
-    win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4, curses.A_BOLD)
+    win.attroff(cp("border"))
+    win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4,
+                cp("card_accent") | curses.A_BOLD)
     for i, line in enumerate(lines):
-        win.addnstr(1 + i, 2, short(line, width - 4), width - 4)
-    win.addnstr(
-        height - 2, 2, short(hint, width - 4), width - 4, curses.color_pair(INFO)
-    )
+        win.addnstr(1 + i, 3, short(line, width - 7), width - 7, cp("card"))
+    win.addnstr(height - 2, 3, short(hint, width - 7), width - 7, cp("card_accent"))
     win.refresh()
     while True:
         try:
@@ -322,6 +431,58 @@ def dialog(stdscr, title: str, lines: list[str], options: list[tuple[str, str]],
             char = chr(key).lower()
             if any(char == option[0].lower() for option in options):
                 return char
+
+
+def input_dialog(stdscr, title: str, prompt: str, default: str = "") -> str | None:
+    h, w = stdscr.getmaxyx()
+    width = min(max(52, len(prompt) + 10, len(default) + 10), w - 4)
+    height = 5
+    y0 = max(0, (h - height) // 2)
+    x0 = max(0, (w - width) // 2)
+    win = curses.newwin(height, width, y0, x0)
+    win.keypad(True)
+    text = default
+    curses.curs_set(1)
+    result = None
+    try:
+        while True:
+            win.bkgd(" ", cp("card"))
+            win.erase()
+            win.attron(cp("border"))
+            win.box()
+            win.attroff(cp("border"))
+            win.addnstr(0, 2, short(f" {title} ", width - 4), width - 4,
+                        cp("card_accent") | curses.A_BOLD)
+            win.addnstr(1, 3, short(prompt, width - 6), width - 6, cp("card_muted"))
+            field_width = max(4, width - 8)
+            shown = text[-field_width:] if len(text) > field_width else text
+            win.addnstr(2, 3, "› " + shown, field_width, cp("card"))
+            win.addnstr(height - 2, 3, "[Entrée] valider   [Échap] annuler",
+                        width - 6, cp("card_muted"))
+            try:
+                win.move(2, 5 + len(shown))
+            except curses.error:
+                pass
+            win.refresh()
+            try:
+                key = win.get_wch()
+            except curses.error:
+                continue
+            if key == "\x1b":
+                break
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                result = text.strip()
+                break
+            if key in (curses.KEY_BACKSPACE, "\b", "\x7f", "\x08"):
+                text = text[:-1]
+                continue
+            if isinstance(key, str) and key.isprintable():
+                text += key
+    except KeyboardInterrupt:
+        result = None
+    finally:
+        curses.curs_set(0)
+    return result
 
 
 def git_identity(cwd: Path) -> tuple[str, str]:
@@ -387,6 +548,62 @@ def is_moveable_script(path: Path) -> bool:
             return handle.read(2) == b"#!"
     except OSError:
         return False
+
+
+def dirty_name(line: str) -> str:
+    return line[3:] if len(line) > 3 else line
+
+
+def commit_flow(stdscr, entry: Entry) -> str:
+    if not entry.dirty:
+        return "Aucune modification à commiter."
+    files = ", ".join(dirty_name(line) for line in entry.dirty)
+    more = f" (+{len(entry.dirty)} fichiers)" if len(entry.dirty) > 1 else ""
+    wrapped = textwrap.wrap(files, 54) or [""]
+    default_message = f"chore: mise à jour {datetime.now():%d/%m/%Y %H:%M}"
+    lines = [
+        f"{len(entry.dirty)} fichier(s) modifié(s)",
+        *wrapped[:3],
+        "",
+        f"Message : {default_message}",
+    ]
+    choice = dialog(
+        stdscr,
+        f"Commiter {entry.name} ?",
+        lines,
+        [("o", "Commiter et pousser"), ("m", "Changer le message"), ("n", "Annuler")],
+        default="n",
+    )
+    if choice is None or choice == "n":
+        return "Commit annulé."
+    message = default_message
+    if choice == "m":
+        edited = input_dialog(stdscr, "Message de commit", "Message :", message)
+        if edited is None:
+            return "Commit annulé."
+        message = edited or message
+    show_progress(stdscr, f"Commit de {entry.name}…")
+    ok, out = run(["git", "add", "-A"], entry.path, timeout=60)
+    if not ok:
+        return f"Échec de git add : {out}"
+    ok, out = run(["git", "commit", "-m", message], entry.path, timeout=60)
+    if not ok:
+        return f"Échec du commit : {out}"
+    if entry.upstream:
+        show_progress(stdscr, "Envoi vers le remote…")
+        ok, out = run(["git", "push"], entry.path, timeout=120)
+        if not ok:
+            return f"Commité, mais push échoué : {out}"
+        return f"{entry.name} commité et poussé."
+    if entry.remote_url:
+        show_progress(stdscr, "Envoi vers le remote…")
+        ok, out = run(
+            ["git", "push", "-u", "origin", entry.branch], entry.path, timeout=120
+        )
+        if not ok:
+            return f"Commité, mais push échoué : {out}"
+        return f"{entry.name} commité et poussé."
+    return f"{entry.name} commité localement (aucun remote configuré)."
 
 
 def move_script_flow(stdscr, entry: Entry) -> str:
@@ -485,152 +702,226 @@ def print_report(entries: list[Entry]) -> int:
     return 0
 
 
+def build_columns(width: int) -> list[tuple[str, int]]:
+    if width >= 90:
+        cols = [("DÉPÔT", 22), ("BRANCHE", 12), ("ÉTAT", 18),
+                ("MODIFS", 7), ("COMMIT", 20)]
+    elif width >= 78:
+        cols = [("DÉPÔT", 20), ("BRANCHE", 10), ("ÉTAT", 18),
+                ("MODIFS", 7), ("COMMIT", 8)]
+    elif width >= 62:
+        cols = [("DÉPÔT", 18), ("ÉTAT", 17), ("MODIFS", 6), ("COMMIT", 8)]
+    else:
+        cols = [("DÉPÔT", 14), ("ÉTAT", 16), ("MODIFS", 5)]
+    used = sum(w for _label, w in cols)
+    cols.append(("MESSAGE", max(6, width - used)))
+    return cols
+
+
+def row_values(entry: Entry, full_commit: bool = False) -> dict[str, str]:
+    return {
+        "DÉPÔT": entry.name,
+        "BRANCHE": entry.branch or "-",
+        "ÉTAT": state_text(entry),
+        "MODIFS": str(len(entry.dirty)) if entry.is_repo else "-",
+        "COMMIT": fmt_commit(entry, full=full_commit),
+        "MESSAGE": entry.last_subject or "",
+    }
+
+
 def draw(stdscr, entries, selected, offset, last_scan, duration, issues_only, message):
-    stdscr.erase()
     h, w = stdscr.getmaxyx()
-    if h < 8 or w < 50:
-        stdscr.addnstr(0, 0, "Terminal trop petit", max(0, w - 1))
+    stdscr.erase()
+    if h < 10 or w < 50:
+        put(stdscr, 0, 0, "Terminal trop petit (min. 50x10)", cp("err"))
         stdscr.refresh()
         return selected, offset
 
     repos = [e for e in entries if e.is_repo]
     visible = visible_entries(entries, issues_only)
-
     if visible:
         selected = max(0, min(selected, len(visible) - 1))
     else:
         selected = 0
 
-    header = f" Commit Check — {len(repos)} dépôts · scan {last_scan} ({duration:.1f}s)"
-    stdscr.attron(curses.A_BOLD)
-    stdscr.addnstr(0, 0, header, w - 1, curses.color_pair(INFO))
-    stdscr.attroff(curses.A_BOLD)
-
     bad = problems(entries)
-    summary = (
-        f" {len(bad)} à vérifier · "
-        f"{sum(1 for e in repos if e.dirty)} avec modifs non commitées"
-    )
-    stdscr.addnstr(1, 0, summary, w - 1, curses.color_pair(ERR if bad else OK))
+    dirty_count = sum(1 for e in repos if e.dirty)
 
-    if w >= 90:
-        cols = [
-            ("Dépôt", 22),
-            ("Branche", 11),
-            ("État", 17),
-            ("Modifs", 7),
-            ("Dernier commit", 18),
-            ("Message", w - 79),
-        ]
-    elif w >= 72:
-        cols = [
-            ("Dépôt", 18),
-            ("Branche", 9),
-            ("État", 15),
-            ("Modifs", 6),
-            ("Commit", 18),
-            ("Message", w - 69),
-        ]
+    put(stdscr, 0, 1, "Moniteur de commits", cp("bg") | curses.A_BOLD)
+    if bad:
+        badge = f"● {len(bad)} à vérifier"
+        badge_pair = "err"
+    elif dirty_count:
+        badge = f"● {dirty_count} modif. locale(s)"
+        badge_pair = "warn"
     else:
-        cols = [
-            ("Dépôt", 16),
-            ("Branche", 8),
-            ("État", 14),
-            ("Modifs", 5),
-            ("Message", w - 45),
-        ]
-    x = 1
-    stdscr.attron(curses.A_UNDERLINE)
-    for label, width in cols:
-        stdscr.addnstr(3, x, label, width)
-        x += width
-    stdscr.attroff(curses.A_UNDERLINE)
+        badge = "● tout est synchronisé"
+        badge_pair = "ok"
+    put(stdscr, 0, max(1, w - len(badge) - 2), badge, cp(badge_pair) | curses.A_BOLD)
 
-    detail_h = 0 if not visible else min(9, max(6, h - 7))
-    table_top = 4
-    table_bottom = h - detail_h - 2
-    rows = max(1, table_bottom - table_top)
+    subtitle = (
+        f"Dépôts et scripts locaux · scan {last_scan} · "
+        f"{len(repos)} dépôts · {duration:.1f}s"
+    )
+    put(stdscr, 1, 1, short(subtitle, w - 2), cp("muted"))
+
+    card_top, card_left, card_right = 2, 1, w - 2
+    detail_h = 7 if h >= 18 else 0
+    footer_y = h - 1
+    if detail_h:
+        detail_bottom = h - 2
+        detail_top = detail_bottom - detail_h + 1
+        card_bottom = detail_top - 1
+    else:
+        detail_top = detail_bottom = None
+        card_bottom = footer_y - 1
+
+    draw_box(stdscr, card_top, card_left, card_bottom, card_right)
+    inner_left = card_left + 2
+    inner_right = card_right - 2
+    inner_width = max(1, inner_right - inner_left + 1)
+
+    cols = build_columns(inner_width)
+    header_y = card_top + 1
+    x = inner_left
+    for label, width in cols:
+        put(stdscr, header_y, x, short(label, width - 1), cp("card_muted") | curses.A_BOLD)
+        x += width
+    fill(stdscr, header_y + 1, inner_left, inner_right, "card_muted", "─")
+
+    rows_top = header_y + 2
+    rows = max(1, card_bottom - rows_top)
     if selected < offset:
         offset = selected
     elif selected >= offset + rows:
         offset = selected - rows + 1
 
-    for i, e in enumerate(visible[offset : offset + rows]):
-        y = table_top + i
-        attr = curses.color_pair(e.color)
-        if offset + i == selected:
-            attr |= curses.A_REVERSE
-        values = [
-            (e.name, cols[0][1]),
-            (e.branch or "-", cols[1][1]),
-            (e.state, cols[2][1]),
-            (str(len(e.dirty)) if e.is_repo else "-", cols[3][1]),
-            (fmt_commit(e), cols[4][1]),
-        ]
-        if len(cols) == 6:
-            values.append((e.last_subject or "", cols[5][1]))
-        x = 1
-        for value, width in values:
-            stdscr.addnstr(y, x, short(value, width - 1), width - 1, attr)
-            x += width
-
-    if not visible:
-        stdscr.addnstr(table_top + 1, 2, "Aucun problème détecté.", w - 4,
-                       curses.color_pair(OK))
+    if visible:
+        for i, entry in enumerate(visible[offset : offset + rows]):
+            y = rows_top + i
+            is_selected = (offset + i) == selected
+            if is_selected:
+                fill(stdscr, y, inner_left, inner_right, "sel")
+                base = "sel"
+                colors = {
+                    "name": "sel", "muted": "sel", "state": "sel",
+                    "warn": "sel", "ok": "sel", "err": "sel",
+                }
+            else:
+                fill(stdscr, y, inner_left, inner_right, "card")
+                base = "card"
+                colors = {
+                    "name": "card", "muted": "card_muted", "state": "card",
+                    "warn": "card_warn", "ok": "card_ok", "err": "card_err",
+                }
+            pair_for = {
+                OK: colors["ok"], WARN: colors["warn"],
+                ERR: colors["err"], INFO: colors["name"], DIM: colors["muted"],
+            }[entry.color]
+            full_commit = next(
+                (width for label, width in cols if label == "COMMIT"), 8
+            ) >= 19
+            values = row_values(entry, full_commit)
+            x = inner_left
+            for label, width in cols:
+                value = values[label]
+                if is_selected:
+                    pair = "sel"
+                elif label == "DÉPÔT":
+                    pair = "card"
+                elif label == "ÉTAT":
+                    pair = pair_for
+                elif label == "MODIFS":
+                    pair = "card_warn" if entry.dirty else "card_muted"
+                elif label == "BRANCHE":
+                    pair = "card_muted"
+                elif label == "COMMIT":
+                    pair = "card_muted"
+                else:
+                    pair = "card_muted"
+                put(stdscr, y, x, short(value, width - 1), cp(pair), width - 1)
+                x += width
+    else:
+        put(stdscr, rows_top + 1, inner_left + 2, "Aucun dépôt à afficher.",
+            cp("card_muted"))
 
     if detail_h and visible:
-        e = visible[selected]
-        top = h - detail_h - 1
-        stdscr.addnstr(top, 1, "─" * (w - 2), w - 2, curses.color_pair(DIM))
-        y = top + 1
-        stdscr.addnstr(y, 2, short(str(e.path), w - 4), w - 4, curses.color_pair(INFO))
+        entry = visible[selected]
+        draw_box(stdscr, detail_top, card_left, detail_bottom, card_right)
+        for line_y in range(detail_top + 1, detail_bottom):
+            fill(stdscr, line_y, inner_left, inner_right, "card")
+        y = detail_top + 1
+        put(stdscr, y, inner_left, "▸ ", cp("card_accent") | curses.A_BOLD)
+        put(stdscr, y, inner_left + 2, short(str(entry.path), inner_width - 2),
+            cp("card_accent"))
         y += 1
-        if e.is_repo:
-            line = f"Remote : {e.remote_url or '-'}"
-            if e.upstream:
-                line += f"   Suivi : {e.upstream}   Avance/retard : {e.ahead}/{e.behind}"
-            stdscr.addnstr(y, 2, short(line, w - 4), w - 4)
+        if entry.is_repo:
+            line = f"Remote  {entry.remote_url or '-'}"
+            if entry.upstream:
+                line += f"   ·   Suivi  {entry.upstream}"
+            line += f"   ·   Écart  {entry.ahead}↑ {entry.behind}↓"
+            put(stdscr, y, inner_left, short(line, inner_width), cp("card_muted"))
             y += 1
-            if e.last_hash:
-                line = f"{e.last_hash} · {e.last_date} · {e.last_author} — {e.last_subject}"
-                stdscr.addnstr(y, 2, short(line, w - 4), w - 4)
-                y += 1
-            if e.dirty:
-                files = ", ".join(line[3:] if len(line) > 3 else line for line in e.dirty[:4])
-                more = " …" if len(e.dirty) > 4 else ""
-                stdscr.addnstr(
-                    y, 2, short(f"Modifs : {files}{more}", w - 4), w - 4,
-                    curses.color_pair(WARN),
+            commit = "-"
+            if entry.last_hash:
+                commit = (
+                    f"{entry.last_hash}  ·  {entry.last_date}  ·  "
+                    f"{entry.last_author} — {entry.last_subject}"
                 )
-            elif not e.fetch_ok:
-                stdscr.addnstr(
-                    y, 2, short(f"Erreur : {e.fetch_error}", w - 4), w - 4,
-                    curses.color_pair(ERR),
-                )
+            put(stdscr, y, inner_left, short(commit, inner_width), cp("card"))
+            y += 1
+            if entry.dirty:
+                names = ", ".join(dirty_name(line) for line in entry.dirty[:4])
+                more = " …" if len(entry.dirty) > 4 else ""
+                put(stdscr, y, inner_left,
+                    short(f"Modifs   {len(entry.dirty)} fichier(s) : {names}{more}",
+                          inner_width),
+                    cp("card_warn"))
+            elif not entry.fetch_ok:
+                put(stdscr, y, inner_left, short(f"Erreur   {entry.fetch_error}",
+                                                inner_width), cp("card_err"))
+            else:
+                put(stdscr, y, inner_left, "Modifs   aucune", cp("card_muted"))
         else:
-            if e.path.is_dir():
-                hint = "Pas un dépôt git — appuyer sur c pour l'initialiser."
-            elif is_moveable_script(e.path):
-                hint = "Script hors git — appuyer sur c pour le déplacer dans scripts-perso."
+            if entry.path.is_dir():
+                hint = "Pas un dépôt git — c pour l'initialiser."
+            elif is_moveable_script(entry.path):
+                hint = "Script hors git — c pour le déplacer dans scripts-perso."
             else:
                 hint = "Fichier hors git — déplacement non proposé."
-            stdscr.addnstr(y, 2, short(hint, w - 4), w - 4, curses.color_pair(DIM))
-        stdscr.addnstr(y + 1, 2, message, w - 4, curses.color_pair(DIM))
+            put(stdscr, y, inner_left, short(hint, inner_width), cp("card_muted"))
+        put(stdscr, detail_bottom - 1, inner_left, short(message, inner_width),
+            cp("card_muted"))
 
-    footer = " ↑↓ naviguer · r rafraîchir · f filtre · c créer · q quitter"
-    if issues_only:
-        footer = " [filtre problèmes] " + footer
-    stdscr.addnstr(h - 1, 0, short(footer, w - 1), w - 1, curses.A_REVERSE)
+    fill(stdscr, footer_y, 0, w - 2, "bar")
+    hints = [
+        ("↑↓", "naviguer"), ("r", "rafraîchir"), ("f", "filtre"),
+        ("c", "commiter / créer"), ("q", "quitter"),
+    ]
+    x = 1
+    for key, label in hints:
+        if x >= w - 2:
+            break
+        put(stdscr, footer_y, x, key, cp("bar_key") | curses.A_BOLD)
+        x += len(key) + 1
+        put(stdscr, footer_y, x, label, cp("bar"))
+        x += len(label) + 3
+    if issues_only and w > 60:
+        badge = " filtre problèmes "
+        put(stdscr, footer_y, w - len(badge) - 2, badge,
+            cp("bar_key") | curses.A_BOLD)
+
     stdscr.refresh()
     return selected, offset
 
 
-def run_tui(stdscr, roots: list[Path]):
+def run_tui(stdscr, roots: list[tuple[Path, bool]]):
     curses.curs_set(0)
-    curses.use_default_colors()
-    for idx, fg in ((OK, curses.COLOR_GREEN), (WARN, curses.COLOR_YELLOW),
-                    (ERR, curses.COLOR_RED), (INFO, curses.COLOR_CYAN), (DIM, -1)):
-        curses.init_pair(idx, fg, -1)
+    setup_colors()
+    try:
+        stdscr.bkgd(" ", cp("bg"))
+    except curses.error:
+        pass
     stdscr.keypad(True)
 
     entries: list[Entry] = []
@@ -683,17 +974,19 @@ def run_tui(stdscr, roots: list[Path]):
                 continue
             entry = visible[min(selected, len(visible) - 1)]
             if entry.is_repo:
-                message = f"{entry.name} est déjà un dépôt git."
+                if not entry.dirty:
+                    message = f"{entry.name} n'a aucune modification à commiter."
+                    continue
+                result = commit_flow(stdscr, entry)
             elif entry.path.is_dir():
                 result = create_flow(stdscr, entry)
-                refresh()
-                message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
             elif is_moveable_script(entry.path):
                 result = move_script_flow(stdscr, entry)
-                refresh()
-                message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
             else:
                 message = "Ce fichier n'est pas un script déplaçable."
+                continue
+            refresh()
+            message = f"{result} · {len(problems(entries))} dépôt(s) à vérifier"
 
 
 def main() -> int:
