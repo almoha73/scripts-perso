@@ -649,6 +649,8 @@ _claude_profile_cache = {}
 # et, après un 429, on attend le délai demandé (Retry-After) en gardant les dernières valeurs.
 CLAUDE_USAGE_MIN_INTERVAL = 300
 CLAUDE_USAGE_BACKOFF = 600
+# Fréquence de surveillance du fichier d'identifiants, pour actualiser dès que le jeton change.
+CLAUDE_CREDENTIALS_POLL_MS = 2000
 _claude_usage_cache = {"usage": None, "fetched_at": 0.0, "next_try": 0.0}
 
 
@@ -793,10 +795,10 @@ def fetch_claude_data():
     if not token:
         result["error"] = "Claude : aucun jeton, connecte-toi dans Claude Code."
         return result
-    # On ne renouvelle pas le jeton nous-mêmes : Claude Code le fait à chaque lancement,
-    # et un renouvellement ici invaliderait celui de la session en cours.
+    # On ne renouvelle pas le jeton nous-mêmes : Claude Code le fait à sa première requête
+    # (pas au simple lancement), et un renouvellement ici invaliderait celui de la session.
     if expires_at and expires_at / 1000 < time.time():
-        result["error"] = "Claude : jeton expiré, ouvre Claude Code pour le renouveler."
+        result["error"] = "Claude : jeton expiré, envoie un message dans Claude Code pour le renouveler."
         return result
 
     cache = _claude_usage_cache
@@ -823,7 +825,7 @@ def fetch_claude_data():
                 text = "trop de requêtes (429), nouvel essai à " + time.strftime(
                     "%H:%M", time.localtime(cache["next_try"]))
             elif "401" in text or "403" in text:
-                text = "jeton refusé, ouvre Claude Code pour le renouveler."
+                text = "jeton refusé, envoie un message dans Claude Code pour le renouveler."
             if cache["usage"] is None:
                 result["error"] = "Claude : " + (text or "erreur inconnue")
                 return result
@@ -1241,7 +1243,24 @@ class GoMonitor(tk.Tk):
         self.geometry(f"{width}x{height}")
         self.minsize(1280, 760)
         self._center(width, height)
+        self._credentials_mtime = self._read_credentials_mtime()
         self.refresh(initial=True)
+        self.after(CLAUDE_CREDENTIALS_POLL_MS, self._watch_credentials)
+
+    def _read_credentials_mtime(self):
+        try:
+            return CLAUDE_CREDENTIALS.stat().st_mtime
+        except OSError:
+            return None
+
+    def _watch_credentials(self):
+        mtime = self._read_credentials_mtime()
+        # Si une actualisation est en cours, on réessaie au prochain passage.
+        if mtime != self._credentials_mtime and not self._loading:
+            self._credentials_mtime = mtime
+            # Nouveau jeton écrit par Claude Code : on n'attend pas le cycle de 60 s.
+            self.refresh()
+        self.after(CLAUDE_CREDENTIALS_POLL_MS, self._watch_credentials)
 
     def _set_icon(self):
         icon_path = Path(__file__).with_name("icon.png")
